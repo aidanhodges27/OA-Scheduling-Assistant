@@ -10,6 +10,9 @@ import gspread.utils as a1
 import pandas as pd
 import plotly.express as px
 
+from .. import config
+from ..core import summer_schedule
+
 from ..core import week_range as week_range_mod
 
 from ..config import (
@@ -802,6 +805,37 @@ def get_user_schedule(ss: gspread.Spreadsheet, _schedule_unused, oa_name: str) -
         ...
       }
     """
+    if getattr(config, "SUMMER_MODE", False):
+        result: Dict[str, Dict[str, List]] = {
+            d: {"UNH": [], "MC": [], "On-Call": []} for d in _WEEK_ORDER_7
+        }
+
+        try:
+            found = summer_schedule.list_person_shifts(ss, oa_name).get(oa_name, [])
+        except Exception:
+            return result
+
+        seen = set()
+
+        for actual_date, tab_title, start, end in found:
+            day = actual_date.strftime("%A").lower()
+
+            key = (actual_date.isoformat(), start, end, tab_title)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            result[day]["On-Call"].append(
+                {
+                    "start": start,
+                    "end": end,
+                    "date": actual_date.isoformat(),
+                    "tab": tab_title,
+                    "source": "Summer"
+                }
+            )
+
+        return result   
     titles = _open_three(ss)
     result: Dict[str, Dict[str, List[Tuple[str, str]]]] = {
         d: {"UNH": [], "MC": [], "On-Call": []} for d in _WEEK_ORDER_7
@@ -1129,6 +1163,7 @@ _SOURCE_COLOR = {
     "UNH": "#4F46E5",      # indigo-600
     "MC": "#16A34A",       # green-600
     "On-Call": "#F59E0B",  # amber-500
+    "Summer": "#4F46E5",  # indigo-600 (same as UNH, but labeled "Summer" in chat)
 }
 
 _DAY_ORDER = list(_WEEK_ORDER_7)
@@ -1236,25 +1271,47 @@ def build_schedule_dataframe(user_sched: Dict[str, Dict[str, List[Tuple[str, str
 
     for day in _DAY_ORDER:
         buckets = user_sched.get(day, {})
-        for src in ("UNH","MC","On-Call"):
-            for (s, e) in _iter_time_pairs(buckets.get(src, [])):
-                plot_start = _anchor_dt(s, anchors[day])
-                plot_end   = _anchor_dt(e, anchors[day])
+        for src in ("UNH", "MC", "On-Call"):
+            for block in (buckets.get(src, []) or []):
+                pair = _extract_time_pair(block)
+                if not pair:
+                    continue
+
+                s, e = pair
+
+                # Normal old schedule behavior: anchor to current week.
+                anchor_date = anchors[day]
+
+                # Summer schedule behavior: preserve the real date from the parser.
+                if isinstance(block, dict) and block.get("date"):
+                    try:
+                        anchor_date = date.fromisoformat(str(block["date"]))
+                    except Exception:
+                        anchor_date = anchors[day]
+
+                plot_start = _anchor_dt(s, anchor_date)
+                plot_end = _anchor_dt(e, anchor_date)
+
                 if plot_end <= plot_start:
                     plot_end += timedelta(days=1)
 
                 dur_min = int((plot_end - plot_start).total_seconds() // 60)
 
+                display_source = "Summer" if isinstance(block, dict) and block.get("source") == "Summer" else src
+
                 rows.append({
                     "Day": _DAY_TITLE[day],
-                    "Source": src,
+                    "Source": display_source,
                     "Start": s,
                     "End": e,
-                    "Date": plot_start.date(),   # <-- only date, replaces StartDT/EndDT
+                    "Date": plot_start.date(),
                     "DurationMin": dur_min,
-                    "Duration": (f"{dur_min//60}h" if dur_min % 60 == 0
-                                 else f"{dur_min//60}h {dur_min%60}m"),
-                    "PlotStartDT": plot_start,  # keep full datetime for chart
+                    "Duration": (
+                        f"{dur_min//60}h"
+                        if dur_min % 60 == 0
+                        else f"{dur_min//60}h {dur_min%60}m"
+                    ),
+                    "PlotStartDT": plot_start,
                     "PlotEndDT": plot_end,
                 })
 
@@ -1265,9 +1322,19 @@ def build_schedule_dataframe(user_sched: Dict[str, Dict[str, List[Tuple[str, str
         ])
 
     df = pd.DataFrame(rows)
-    df["DayOrder"] = df["Day"].map({v: i for i, v in enumerate([_DAY_TITLE[d] for d in _DAY_ORDER])})
-    df.sort_values(["DayOrder","PlotStartDT","Source"], inplace=True, kind="stable")
+
+    df.drop_duplicates(
+        subset=["Date", "Day", "Source", "Start", "End"],
+        inplace=True,
+    )
+
+    df["DayOrder"] = df["Day"].map({
+        v: i for i, v in enumerate([_DAY_TITLE[d] for d in _DAY_ORDER])
+    })
+
+    df.sort_values(["Date", "DayOrder", "PlotStartDT", "Source"], inplace=True, kind="stable")
     df.drop(columns=["DayOrder"], inplace=True)
+
     return df
 
 def render_schedule_viz(st, df: pd.DataFrame, *, title: str = "This Week's Schedule"):
@@ -1281,6 +1348,27 @@ def render_schedule_viz(st, df: pd.DataFrame, *, title: str = "This Week's Sched
     if df.empty:
         st.info("No shifts found for your name.")
         return
+    
+    # Summer mode: the full schedule table can contain the whole summer,
+    # but this chart is labeled "This Week", so only show one Sunday-Saturday week.
+    try:
+        from .. import config
+
+        if getattr(config, "SUMMER_MODE", False) and "Date" in df.columns:
+            today = week_range_mod.la_today()
+            week_start = today - timedelta(days=((today.weekday() + 1) % 7))
+            week_end = week_start + timedelta(days=6)
+
+            df = df[
+                (pd.to_datetime(df["Date"]).dt.date >= week_start)
+                & (pd.to_datetime(df["Date"]).dt.date <= week_end)
+            ].copy()
+
+            if df.empty:
+                st.info("No shifts found for your name this week.")
+                return
+    except Exception:
+        pass
 
     try:
         import plotly.graph_objects as go

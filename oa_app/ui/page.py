@@ -2964,6 +2964,8 @@ def run() -> None:
                 # Keep the existing current-week rule for MC/UNH, but allow
                 # On-Call week tabs to color their own schedule grid immediately.
                 should_color_now = _should_color_schedule_now(campus_key=campus_key, event_d=event_d)
+                if getattr(config, "SUMMER_MODE", False):
+                    should_color_now = True
 
                 if should_color_now:
                     msg = chat_callout.handle_callout(
@@ -3705,30 +3707,42 @@ def run() -> None:
             # IMPORTANT: when a specific tab is selected in the sidebar, we must
             # derive assignments from that same tab. (Especially for On-Call,
             # where different weekly tabs can have different layouts.)
+            # Summer mode uses the date-based summer parser, not the old UNH/MC parser.
+            kind = campus_kind(active_tab)
+
             try:
-                base_titles = schedule_query._open_three(ss) or []  # UNH, MC, On-Call
-                unh_title = base_titles[0] if len(base_titles) >= 1 else None
-                mc_title = base_titles[1] if len(base_titles) >= 2 else None
-                oncall_title = active_tab if campus_kind(active_tab) == "ONCALL" else (base_titles[2] if len(base_titles) >= 3 else None)
-                user_sched_all = cached_user_schedule_for_titles(
-                    ss.id,
-                    canon_name,
-                    unh_title,
-                    mc_title,
-                    oncall_title,
-                    epoch_key,
-                )
+                if getattr(config, "SUMMER_MODE", False):
+                    user_sched_all = cached_user_schedule(ss.id, canon_name, epoch_key)
+                    src_label = "On-Call"  # summer shifts are stored here but labeled as Summer
+                else:
+                    base_titles = schedule_query._open_three(ss) or []  # UNH, MC, On-Call
+                    unh_title = base_titles[0] if len(base_titles) >= 1 else None
+                    mc_title = base_titles[1] if len(base_titles) >= 2 else None
+                    oncall_title = active_tab if campus_kind(active_tab) == "ONCALL" else (base_titles[2] if len(base_titles) >= 3 else None)
+                    user_sched_all = cached_user_schedule_for_titles(
+                        ss.id,
+                        canon_name,
+                        unh_title,
+                        mc_title,
+                        oncall_title,
+                        epoch_key,
+                    )
+                    src_label = {"UNH": "UNH", "MC": "MC", "ONCALL": "On-Call"}[kind]
             except Exception:
                 user_sched_all = {}
+                src_label = "On-Call" if getattr(config, "SUMMER_MODE", False) else {"UNH": "UNH", "MC": "MC", "ONCALL": "On-Call"}[kind]
 
-            kind = campus_kind(active_tab)
-            src_label = {"UNH": "UNH", "MC": "MC", "ONCALL": "On-Call"}[kind]
             days_all = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
             day_pool = weekday_filter(days_all, active_tab)
-            day_options = [d for d in day_pool if (user_sched_all.get(d, {}) or {}).get(src_label, [])]
 
-            if not day_options:
-                st.info(f"No {src_label} shifts to remove.")
+            d_opts = [
+                d for d in day_pool
+                if (user_sched_all.get(d, {}) or {}).get(src_label, [])
+            ]
+
+            if not d_opts:
+                label = "summer shifts" if getattr(config, "SUMMER_MODE", False) else f"{src_label} assignments"
+                st.info(f"No {label} found to call-out from.")
             else:
                 dsel = st.radio("Step A — Pick day", [d.title() for d in day_options], horizontal=True)
                 day_canon = dsel.lower()
@@ -3898,14 +3912,53 @@ def run() -> None:
                 dsel = st.radio("Step A — Day", [d.title() for d in d_opts], horizontal=True)
                 day_canon = dsel.lower()
                 ranges_today_raw = (user_sched_all.get(day_canon, {}) or {}).get(src_label, []) or []
-                ranges_today = _iter_pairs(ranges_today_raw)
-                labels = [f"{s} – {e}" for (s, e) in ranges_today]
+
+                callout_blocks = []
+                for block in ranges_today_raw:
+                    pair = schedule_query._extract_time_pair(block)
+                    if not pair:
+                        continue
+
+                    s_str, e_str = pair
+                    actual_date = None
+                    source_label = src_label
+
+                    if isinstance(block, dict):
+                        source_label = block.get("source") or source_label
+                        if block.get("date"):
+                            try:
+                                actual_date = date.fromisoformat(str(block["date"]))
+                            except Exception:
+                                actual_date = None
+
+                    label_date = actual_date.strftime("%a %-m/%-d/%Y") if actual_date else day_canon.title()
+
+                    callout_blocks.append(
+                        {
+                            "label": f"{label_date} • {source_label} • {s_str} – {e_str}",
+                            "date": actual_date,
+                            "start": s_str,
+                            "end": e_str,
+                            "source": source_label,
+                        }
+                    )
+
+                labels = [b["label"] for b in callout_blocks]
                 which = st.selectbox("Step B — Which window are you calling out for?", labels)
-                idx = labels.index(which)
-                s_str, e_str = ranges_today[idx]
+                selected_callout = callout_blocks[labels.index(which)]
+
+                s_str = selected_callout["start"]
+                e_str = selected_callout["end"]
+
                 sdt = datetime.strptime(s_str, "%I:%M %p")
                 edt = datetime.strptime(e_str, "%I:%M %p")
 
+                if selected_callout.get("date"):
+                    actual_date = selected_callout["date"]
+                    sdt = datetime.combine(actual_date, sdt.time())
+                    edt = datetime.combine(actual_date, edt.time())
+                    if edt <= sdt:
+                        edt = edt + timedelta(days=1)
                 # Support partial callouts (30-minute increments).
                 sdt0 = sdt
                 edt0 = edt
@@ -3971,9 +4024,18 @@ def run() -> None:
                         callout_end = edt0
 
                 # UNH/MC callouts: allow specifying the calendar date (used for logs/DB).
-                event_date = None
+                # Summer shifts already carry their actual date from the parser.
+                event_date = selected_callout.get("date")
                 event_date_valid = True
-                if kind in {"UNH", "MC"}:
+
+                if getattr(config, "SUMMER_MODE", False):
+                    if not event_date:
+                        st.warning("Could not derive the actual summer shift date.")
+                        event_date_valid = False
+                    else:
+                        st.caption(f"Selected date: {event_date.isoformat()} ({event_date.strftime('%A')})")
+
+                elif kind in {"UNH", "MC"}:
                     default_d = _callout_event_date_for_sheet(ss, active_tab, day_canon)
                     if not default_d:
                         st.warning("Could not derive the shift date from the selected day.")
@@ -4006,20 +4068,26 @@ def run() -> None:
                     reason = f"other:{other_txt.strip()}" if other_txt.strip() else "other"
 
                 # Per policy: callouts proceed directly and are always logged as "no cover".
-                can_apply_callout = bool(kind == "ONCALL" or event_date_valid)
+                can_apply_callout = bool(getattr(config, "SUMMER_MODE", False) or kind == "ONCALL" or event_date_valid)
                 if st.button("Apply Call-Out", disabled=not can_apply_callout):
                     try:
                         # Derive event date
-                        campus_key = ("ONCALL" if kind == "ONCALL" else kind)
-                        if kind in {"UNH", "MC"}:
+                        # Derive event date
+                        if getattr(config, "SUMMER_MODE", False):
+                            campus_key = "SUMMER"
                             if not event_date:
-                                raise ValueError("Callout missing date. Could not derive a date for the selected day.")
+                                raise ValueError("Callout missing actual summer date.")
                             event_d = event_date
                         else:
-                            event_d = _oncall_event_date(active_tab, day_canon)
-                            if not event_d:
-                                raise ValueError("Could not derive On-Call event date from sheet title")
-
+                            campus_key = ("ONCALL" if kind == "ONCALL" else kind)
+                            if kind in {"UNH", "MC"}:
+                                if not event_date:
+                                    raise ValueError("Callout missing date. Could not derive a date for the selected day.")
+                                event_d = event_date
+                            else:
+                                event_d = _oncall_event_date(active_tab, day_canon)
+                                if not event_d:
+                                    raise ValueError("Could not derive On-Call event date from sheet title")
                         # Keep the existing current-week rule for MC/UNH, but allow
                         # On-Call week tabs to color their own schedule grid immediately.
                         should_color_now = _should_color_schedule_now(campus_key=campus_key, event_d=event_d)
@@ -4032,8 +4100,8 @@ def run() -> None:
                                 canon_target_name=canon_name,
                                 campus_title=active_tab,
                                 day=day_canon,
-                                start=callout_start.time(),
-                                end=callout_end.time(),
+                                start=callout_start if getattr(config, "SUMMER_MODE", False) else callout_start.time(),
+                                end=callout_end if getattr(config, "SUMMER_MODE", False) else callout_end.time(),
                                 covered_by=None,
                             )
                         else:

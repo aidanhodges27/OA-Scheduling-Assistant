@@ -16,14 +16,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Iterable, List, Optional, Tuple
+from .. import config
 
 
 # ----------------------------
 # Constants (minutes)
 # ----------------------------
 
-WEEKLY_CAP_MINS = 20 * 60
-DAILY_CAP_MINS = 8 * 60
+WEEKLY_CAP_MINS = getattr(config, "SUMMER_WEEKLY_CAP_MINS", 20 * 60)
+DAILY_CAP_MINS = getattr(config, "SUMMER_SCHEDULED_SHIFT_MINS", 8 * 60)
 
 # Backwards-compatible aliases (UI may reference these names)
 MAX_WEEKLY_MINS = WEEKLY_CAP_MINS

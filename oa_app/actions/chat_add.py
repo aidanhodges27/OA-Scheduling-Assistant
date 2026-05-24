@@ -722,6 +722,74 @@ def handle_add(
         fail(f"Couldn't understand the day '{day}'.")
     dbg(f"🧭 Day raw={repr(day)} canon={day_canon!r}")
 
+        # ───────────────────────── Summer block schedule ─────────────────────────
+    if getattr(config, "SUMMER_MODE", False):
+        start_label = fmt_time(start_dt)
+        end_label = fmt_time(end_dt)
+
+        valid_windows = set(getattr(config, "SUMMER_SHIFT_WINDOWS", []))
+        if (start_label, end_label) not in valid_windows:
+            fail(
+                "Summer shifts must be either "
+                "7:00 AM–3:30 PM or 3:30 PM–12:00 AM."
+            )
+
+        # The summer sheet has repeated weekdays, so we need an actual date.
+        # Try to get it from the selected sheet/week logic. If unavailable,
+        # fall back to current week.
+        target_date = None
+
+        try:
+            target_date = _date_for_weekday_in_sheet(ss, sheet_title, day_canon)
+        except Exception:
+            target_date = None
+
+        if target_date is None:
+            try:
+                target_date = _date_for_weekday_in_current_la_week(day_canon)
+            except Exception:
+                target_date = None
+
+        if target_date is None:
+            fail(
+                "Could not figure out the actual date for this summer shift. "
+                "The summer sheet needs date-based scheduling, not just weekday names."
+            )
+
+        # Count existing weekly shifts.
+        try:
+            existing = summer_schedule.list_person_shifts(ss, canon_target_name)
+            shifts = existing.get(canon_target_name, [])
+            week_start = target_date - timedelta(days=(target_date.weekday() + 1) % 7)
+            week_end = week_start + timedelta(days=6)
+            shifts_this_week = [
+                item for item in shifts
+                if week_start <= item[0] <= week_end
+            ]
+        except Exception:
+            shifts_this_week = []
+
+        max_shifts = getattr(config, "SUMMER_MAX_SHIFTS_PER_WEEK", 5)
+        if len(shifts_this_week) >= max_shifts:
+            fail(
+                f"{canon_target_name} already has "
+                f"{len(shifts_this_week)}/{max_shifts} shifts that week."
+            )
+
+        capacity = getattr(config, "SUMMER_SHIFT_CAPACITY", 9)
+
+        result = summer_schedule.add_person_to_shift(
+            ss=ss,
+            target_date=target_date,
+            start_label=start_label,
+            end_label=end_label,
+            person_name=canon_target_name,
+            role_prefix="OA",
+            capacity=capacity,
+        )
+
+        return result
+
     # 20h weekly cap (pre)
     # Fast path: use cached hour counter. This avoids a full-grid strict scan on
     # every add (which was the main source of UI lag). If you're extremely close

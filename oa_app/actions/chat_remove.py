@@ -5,6 +5,9 @@ from typing import List, Optional
 import gspread
 import streamlit as st
 
+from .. import config
+from ..core import summer_schedule
+
 from ..core.quotas import bump_ws_version, seed_batch_get_cache
 
 from ..core.utils import fmt_time
@@ -74,6 +77,47 @@ def handle_remove(
     if not day_canon:
         fail(f"Couldn't understand the day '{day}'.")
     dbg(f"🧭 Day parsed: {day_canon}")
+
+    # ───────────────────────── Summer block schedule ─────────────────────────
+    if getattr(config, "SUMMER_MODE", False):
+        start_label = fmt_time(start_dt)
+        end_label = fmt_time(end_dt)
+
+        valid_windows = set(getattr(config, "SUMMER_SHIFT_WINDOWS", []))
+        if (start_label, end_label) not in valid_windows:
+            fail(
+                "Summer shifts must be either "
+                "7:00 AM–3:30 PM or 3:30 PM–12:00 AM."
+            )
+
+        target_date = None
+
+        try:
+            from ..ui.page import _date_for_weekday_in_sheet
+            target_date = _date_for_weekday_in_sheet(ss, sheet_title, day_canon)
+        except Exception:
+            target_date = None
+
+        if target_date is None:
+            try:
+                from ..ui.page import _date_for_weekday_in_current_la_week
+                target_date = _date_for_weekday_in_current_la_week(day_canon)
+            except Exception:
+                target_date = None
+
+        if target_date is None:
+            fail(
+                "Could not figure out the actual date for this summer shift. "
+                "Summer remove needs a date, not just a weekday."
+            )
+
+        return summer_schedule.remove_person_from_shift(
+            ss=ss,
+            target_date=target_date,
+            start_label=start_label,
+            end_label=end_label,
+            person_name=canon_target_name,
+        )
 
     # Fast, cached baseline for success messaging (avoid expensive full rescans).
     # Cache key for hours should change when the underlying sheets change.

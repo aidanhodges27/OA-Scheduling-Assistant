@@ -51,6 +51,13 @@ def campus_kind(title: str) -> str:
 
 
 def weekday_filter(days_list: List[str], tab_title: str) -> List[str]:
+    try:
+        from .. import config as _config
+        if getattr(_config,"SUMMER_MODE", False):
+            return getattr(_config, "SUMMER_DAYS", days_list)
+    except Exception:
+        pass
+        
     return (
         ["monday", "tuesday", "wednesday", "thursday", "friday"]
         if campus_kind(tab_title) in ("UNH", "MC")
@@ -453,6 +460,11 @@ def render_availability_expander(st_mod, ss_id: str, tab_title: str, epoch: int)
         )
         for dcanon, dpretty in zip(days_order, days_pretty):
             slots = avail_map.get(dcanon) or []
+            try:
+                summer_mode = bool(getattr(_config, "SUMMER_MODE", False))
+            except Exception:
+                summer_mode = False
+                
             if kind in ("UNH", "MC") and dcanon in ("saturday", "sunday"):
                 chips_html = '<span class="muted">N/A</span>'
             elif not slots:
