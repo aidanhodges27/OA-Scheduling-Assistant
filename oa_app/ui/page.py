@@ -3881,33 +3881,46 @@ def run() -> None:
         # Guided callout
         elif mode == "callout":
             st.markdown("### Call-Out — Guided")
-            # IMPORTANT: the callout UI should reflect the *selected* roster tab.
-            # The default schedule resolver may pick a different weekly On-Call tab,
-            # which would make the dropdowns not match the sheet we write to.
+            kind = campus_kind(active_tab)
+
+            # Summer mode uses the new date-based summer parser.
+            # Non-summer mode keeps the original UNH/MC/On-Call behavior.
             try:
-                base_titles = schedule_query._open_three(ss) or []  # UNH, MC, On-Call
-                unh_title = base_titles[0] if len(base_titles) >= 1 else None
-                mc_title = base_titles[1] if len(base_titles) >= 2 else None
-                oncall_title = active_tab if campus_kind(active_tab) == "ONCALL" else (base_titles[2] if len(base_titles) >= 3 else None)
-                user_sched_all = cached_user_schedule_for_titles(
-                    ss.id,
-                    canon_name,
-                    unh_title,
-                    mc_title,
-                    oncall_title,
-                    epoch_key,
-                )
+                if getattr(config, "SUMMER_MODE", False):
+                    user_sched_all = cached_user_schedule(ss.id, canon_name, epoch_key)
+                    src_label = "On-Call"  # summer shifts are stored here, displayed as Summer
+                else:
+                    base_titles = schedule_query._open_three(ss) or []  # UNH, MC, On-Call
+                    unh_title = base_titles[0] if len(base_titles) >= 1 else None
+                    mc_title = base_titles[1] if len(base_titles) >= 2 else None
+                    oncall_title = active_tab if campus_kind(active_tab) == "ONCALL" else (base_titles[2] if len(base_titles) >= 3 else None)
+                    user_sched_all = cached_user_schedule_for_titles(
+                        ss.id,
+                        canon_name,
+                        unh_title,
+                        mc_title,
+                        oncall_title,
+                        epoch_key,
+                    )
+                    src_label = {"UNH": "UNH", "MC": "MC", "ONCALL": "On-Call"}[kind]
             except Exception:
                 user_sched_all = {}
+                if getattr(config, "SUMMER_MODE", False):
+                    src_label = "On-Call"
+                else:
+                    src_label = {"UNH": "UNH", "MC": "MC", "ONCALL": "On-Call"}[kind]
 
-            kind = campus_kind(active_tab)
-            src_label = {"UNH": "UNH", "MC": "MC", "ONCALL": "On-Call"}[kind]
             days_all = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
             day_pool = weekday_filter(days_all, active_tab)
-            d_opts = [d for d in day_pool if (user_sched_all.get(d, {}) or {}).get(src_label, [])]
+
+            d_opts = [
+                d for d in day_pool
+                if (user_sched_all.get(d, {}) or {}).get(src_label, [])
+            ]
 
             if not d_opts:
-                st.info(f"No {src_label} assignments found to call-out from.")
+                label = "summer shifts" if getattr(config, "SUMMER_MODE", False) else f"{src_label} assignments"
+                st.info(f"No {label} found to call-out from.")
             else:
                 dsel = st.radio("Step A — Day", [d.title() for d in d_opts], horizontal=True)
                 day_canon = dsel.lower()
@@ -4092,6 +4105,9 @@ def run() -> None:
                         # On-Call week tabs to color their own schedule grid immediately.
                         should_color_now = _should_color_schedule_now(campus_key=campus_key, event_d=event_d)
 
+                        if getattr(config, "SUMMER_MODE", False):
+                            should_color_now = True
+                            
                         if should_color_now:
                             msg = chat_callout.handle_callout(
                                 st,

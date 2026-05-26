@@ -6,6 +6,8 @@ from typing import Optional
 import re
 import gspread
 import streamlit as st
+from .. import config
+from ..core import summer_schedule
 
 from ..core.utils import fmt_time
 from .chat_add import (
@@ -22,6 +24,8 @@ from ..ui.schedule_query import _read_grid, _RANGE_RE, _parse_time_cell, _TIME_C
 from ..core.quotas import bump_ws_version, seed_batch_get_cache
 from ..config import ONCALL_MAX_COLS, ONCALL_MAX_ROWS
 from ..core import week_range
+from .. import config
+from ..core import summer_schedule
 
 # Simple color helpers
 _ORANGE = {"red": 1.0, "green": 0.65, "blue": 0.0}
@@ -291,6 +295,66 @@ def handle_callout(
 
     kind = _campus_kind(campus_title)
     covered_by = (covered_by or "").strip() or None
+
+    # ───────────────────────── Summer block schedule ─────────────────────────
+    if getattr(config, "SUMMER_MODE", False):
+        covered_by = (covered_by or "").strip() or None
+
+        sdt = _ensure_dt(start)
+        edt = _ensure_dt(end, ref_date=sdt.date())
+
+        if edt <= sdt:
+            if 0 <= edt.time().hour <= 5:
+                edt = edt + timedelta(days=1)
+            else:
+                fail("End time must be after start time.")
+
+        start_label = fmt_time(sdt)
+        end_label = fmt_time(edt)
+
+        valid_windows = set(getattr(config, "SUMMER_SHIFT_WINDOWS", []))
+        if (start_label, end_label) not in valid_windows:
+            fail(
+                "Summer callouts must be either "
+                "7:00 AM–3:30 PM or 3:30 PM–12:00 AM."
+            )
+
+        target_date = None
+
+        # Prefer an actual date embedded in the selected schedule block.
+        # The UI update below will pass start/end plus date-aware blocks where possible.
+        try:
+            if hasattr(start, "date"):
+                possible = start.date()
+                if possible.year == 2026:
+                    target_date = possible
+        except Exception:
+            target_date = None
+
+        # Fallback: infer from selected worksheet/week/day.
+        # This is weaker because summer sheets repeat weekdays.
+        if target_date is None:
+            try:
+                from ..ui.page import _date_for_weekday_in_current_la_week
+                day_canon = str(day or "").strip().lower()
+                target_date = _date_for_weekday_in_current_la_week(day_canon)
+            except Exception:
+                target_date = None
+
+        if target_date is None:
+            fail(
+                "Could not figure out the actual summer date for this callout. "
+                "Callouts need a real date, not just a weekday."
+            )
+
+        return summer_schedule.mark_person_callout(
+            ss=ss,
+            target_date=target_date,
+            start_label=start_label,
+            end_label=end_label,
+            person_name=canon_target_name,
+            covered_by=covered_by,
+        )
 
     try:
         ws = ss.worksheet(campus_title)

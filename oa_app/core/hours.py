@@ -26,21 +26,32 @@ from . import week_range as week_range_mod
 # Debug controls (no-UI): secrets/env/session_state
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _hours_debug_enabled() -> bool:
-    """Return True if the caller explicitly enabled slow/verbose counting mode.
-    This only affects *how* we count UNH/MC (fast vs grid), not the resulting totals.
-    """
-    try:
-        if bool(st.session_state.get("HOURS_DEBUG")):
-            return True
-    except Exception:
-        pass
-    if str(os.environ.get("HOURS_DEBUG", "")).strip() not in ("", "0", "false", "False"):
-        return True
-    try:
-        return bool(st.secrets.get("hours_debug", False))
-    except Exception:
-        return False
+def _hours_from_user_sched(user_sched: dict) -> float:
+    total_mins = 0
+
+    for buckets in (user_sched or {}).values():
+        if not isinstance(buckets, dict):
+            continue
+
+        for k in ("UNH", "MC", "On-Call"):
+            for block in (buckets.get(k, []) or []):
+                s = e = None
+
+                if isinstance(block, dict):
+                    s = block.get("start") or block.get("s")
+                    e = block.get("end") or block.get("e")
+                else:
+                    try:
+                        s, e = block[0], block[1]
+                    except Exception:
+                        continue
+
+                if not (s and e):
+                    continue
+
+                total_mins += _mins_between_12h(str(s), str(e))
+
+    return float(total_mins) / 60.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
