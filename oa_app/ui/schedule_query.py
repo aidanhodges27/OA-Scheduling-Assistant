@@ -797,6 +797,18 @@ def _oncall_people_ranges(ws: gspread.Worksheet) -> Dict[str, List[Dict[str, str
 # Public API used by app.py
 # ──────────────────────────────────────────────────────────────────────────────
 
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_summer_person_shifts(ss_id: str, oa_name: str, epoch) -> List:
+    """Cached summer shift list keyed by spreadsheet id + person + sheet epoch."""
+    ss = st.session_state.get("_SS_HANDLE_BY_ID", {}).get(ss_id)
+    if not ss:
+        return []
+    try:
+        return summer_schedule.list_person_shifts(ss, oa_name).get(oa_name, [])
+    except Exception:
+        return []
+
+
 def get_user_schedule(ss: gspread.Spreadsheet, _schedule_unused, oa_name: str) -> Dict[str, Dict[str, List[Tuple[str, str]]]]:
     """
     Returns:
@@ -811,7 +823,14 @@ def get_user_schedule(ss: gspread.Spreadsheet, _schedule_unused, oa_name: str) -
         }
 
         try:
-            found = summer_schedule.list_person_shifts(ss, oa_name).get(oa_name, [])
+            ss_id = getattr(ss, "id", "") or ""
+            epoch = 0
+            try:
+                ver_map = st.session_state.get("WS_VER", {}) or {}
+                epoch = sum(int(v) for v in ver_map.values())
+            except Exception:
+                epoch = st.session_state.get("HOURS_EPOCH", 0)
+            found = _cached_summer_person_shifts(ss_id, oa_name, epoch)
         except Exception:
             return result
 
@@ -894,6 +913,8 @@ def get_user_schedule_for_titles(
     the *same week* the callout came from (UNH/MC + the matching On-Call tab),
     instead of relying on the neighbor-tab heuristic.
     """
+    if getattr(config, "SUMMER_MODE", False):
+        return get_user_schedule(ss, _schedule_unused, oa_name)
 
     result: Dict[str, Dict[str, List[Tuple[str, str]]]] = {
         d: {"UNH": [], "MC": [], "On-Call": []} for d in _WEEK_ORDER_7

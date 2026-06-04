@@ -722,27 +722,30 @@ def handle_add(
         fail(f"Couldn't understand the day '{day}'.")
     dbg(f"🧭 Day raw={repr(day)} canon={day_canon!r}")
 
-        # ───────────────────────── Summer block schedule ─────────────────────────
+    # ───────────────────────── Summer block schedule ─────────────────────────
     if getattr(config, "SUMMER_MODE", False):
-        start_label = fmt_time(start_dt)
-        end_label = fmt_time(end_dt)
+        start_label = summer_schedule._clean_time_label(fmt_time(start_dt))
+        end_label = summer_schedule._clean_time_label(fmt_time(end_dt))
 
-        valid_windows = set(getattr(config, "SUMMER_SHIFT_WINDOWS", []))
+        valid_windows = {
+            (
+                summer_schedule._clean_time_label(a),
+                summer_schedule._clean_time_label(b),
+            )
+            for a, b in getattr(config, "SUMMER_SHIFT_WINDOWS", [])
+        }
         if (start_label, end_label) not in valid_windows:
             fail(
                 "Summer shifts must be either "
                 "7:00 AM–3:30 PM or 3:30 PM–12:00 AM."
             )
 
-        # The summer sheet has repeated weekdays, so we need an actual date.
-        # Try to get it from the selected sheet/week logic. If unavailable,
-        # fall back to current week.
-        target_date = None
-
-        try:
-            target_date = _date_for_weekday_in_sheet(ss, sheet_title, day_canon)
-        except Exception:
-            target_date = None
+        target_date = start_dt.date()
+        if target_date.year < 2000:
+            try:
+                target_date = _date_for_weekday_in_sheet(ss, sheet_title, day_canon)
+            except Exception:
+                target_date = None
 
         if target_date is None:
             try:
@@ -756,7 +759,6 @@ def handle_add(
                 "The summer sheet needs date-based scheduling, not just weekday names."
             )
 
-        # Count existing weekly shifts.
         try:
             existing = summer_schedule.list_person_shifts(ss, canon_target_name)
             shifts = existing.get(canon_target_name, [])
@@ -774,6 +776,15 @@ def handle_add(
             fail(
                 f"{canon_target_name} already has "
                 f"{len(shifts_this_week)}/{max_shifts} shifts that week."
+            )
+
+        paid_mins = int(getattr(config, "SUMMER_PAID_SHIFT_MINS", 8 * 60))
+        weekly_cap_mins = int(getattr(config, "SUMMER_WEEKLY_CAP_MINS", 40 * 60))
+        week_mins = len(shifts_this_week) * paid_mins
+        if week_mins + paid_mins > weekly_cap_mins:
+            fail(
+                f"Would exceed {weekly_cap_mins // 60}h weekly cap: "
+                f"currently {week_mins / 60:.1f}h plus one more shift."
             )
 
         capacity = getattr(config, "SUMMER_SHIFT_CAPACITY", 9)

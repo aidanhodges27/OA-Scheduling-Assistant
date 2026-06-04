@@ -3744,19 +3744,58 @@ def run() -> None:
                 label = "summer shifts" if getattr(config, "SUMMER_MODE", False) else f"{src_label} assignments"
                 st.info(f"No {label} found to call-out from.")
             else:
-                dsel = st.radio("Step A — Pick day", [d.title() for d in day_options], horizontal=True)
+                dsel = st.radio("Step A — Pick day", [d.title() for d in d_opts], horizontal=True)
                 day_canon = dsel.lower()
                 ranges_today_raw = (user_sched_all.get(day_canon, {}) or {}).get(src_label, []) or []
 
-                # On-Call blocks must be removed as whole blocks.
-                if kind == "ONCALL":
-                    ranges_today = _iter_pairs(ranges_today_raw)
-                    labels = [f"{s} – {e}" for (s, e) in ranges_today]
-                    which = st.selectbox("Step B — Select the On-Call block to remove", labels)
-                    idx = labels.index(which)
-                    s_str, e_str = ranges_today[idx]
+                summer_remove = bool(getattr(config, "SUMMER_MODE", False))
+
+                # On-Call / summer blocks must be removed as whole blocks.
+                if kind == "ONCALL" or summer_remove:
+                    remove_blocks = []
+                    for block in ranges_today_raw:
+                        pair = schedule_query._extract_time_pair(block)
+                        if not pair:
+                            continue
+                        s_str, e_str = pair
+                        actual_date = None
+                        source_label = "Summer" if summer_remove else src_label
+                        if isinstance(block, dict):
+                            source_label = block.get("source") or source_label
+                            if block.get("date"):
+                                try:
+                                    actual_date = date.fromisoformat(str(block["date"]))
+                                except Exception:
+                                    actual_date = None
+                        label_date = (
+                            actual_date.strftime("%a %-m/%-d/%Y")
+                            if actual_date
+                            else day_canon.title()
+                        )
+                        remove_blocks.append(
+                            {
+                                "label": f"{label_date} • {source_label} • {s_str} – {e_str}",
+                                "date": actual_date,
+                                "start": s_str,
+                                "end": e_str,
+                            }
+                        )
+                    labels = [b["label"] for b in remove_blocks]
+                    which = st.selectbox(
+                        "Step B — Select the shift to remove",
+                        labels,
+                    )
+                    selected_remove = remove_blocks[labels.index(which)]
+                    s_str = selected_remove["start"]
+                    e_str = selected_remove["end"]
                     sdt = _parse_12h_time(s_str)
                     edt = _parse_12h_time(e_str)
+                    if selected_remove.get("date"):
+                        actual_date = selected_remove["date"]
+                        sdt = datetime.combine(actual_date, sdt.time())
+                        edt = datetime.combine(actual_date, edt.time())
+                        if edt <= sdt:
+                            edt = edt + timedelta(days=1)
                 else:
                     # UNH/MC: allow partial removals in 30-minute increments.
                     ranges_today = _iter_pairs(ranges_today_raw)
@@ -3827,8 +3866,8 @@ def run() -> None:
                             canon_target_name=canon_name,
                             campus_title=active_tab,
                             day=day_canon,
-                            start=sdt.time(),
-                            end=edt.time(),
+                            start=sdt if summer_remove else sdt.time(),
+                            end=edt if summer_remove else edt.time(),
                         )
 
                         try:
@@ -3937,7 +3976,7 @@ def run() -> None:
                     source_label = src_label
 
                     if isinstance(block, dict):
-                        source_label = block.get("source") or source_label
+                        source_label = block.get("source") or "Summer"
                         if block.get("date"):
                             try:
                                 actual_date = date.fromisoformat(str(block["date"]))
@@ -3979,9 +4018,15 @@ def run() -> None:
                     edt0 = edt0 + timedelta(days=1)
                 total_mins = int((edt0 - sdt0).total_seconds() // 60)
 
-                # Policy: On-Call callouts are always for the *entire* shift window.
-                if kind == "ONCALL":
-                    st.info("On-Call call-outs must be for the full shift.")
+                summer_callout = bool(getattr(config, "SUMMER_MODE", False))
+
+                # Policy: On-Call / summer callouts are always for the *entire* shift window.
+                if kind == "ONCALL" or summer_callout:
+                    st.info(
+                        "Summer call-outs must be for the full shift."
+                        if summer_callout
+                        else "On-Call call-outs must be for the full shift."
+                    )
                     duration_mins = total_mins
                     callout_start = sdt0
                     callout_end = edt0

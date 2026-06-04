@@ -7,6 +7,8 @@ from typing import Optional, Tuple, List, Dict
 import gspread
 import gspread.utils as a1
 
+from .. import config
+
 
 SHIFT_RE = re.compile(
     r"^\s*(\d{1,2}:\d{2}\s*(?:am|pm))\s*[-–]\s*(\d{1,2}:\d{2}\s*(?:am|pm))\s*$",
@@ -412,8 +414,13 @@ def list_person_shifts(
 
         grid = ws.get_all_values()
 
+        shift_windows = getattr(
+            config,
+            "SUMMER_SHIFT_WINDOWS",
+            [("7:00 AM", "3:30 PM"), ("3:30 PM", "12:00 AM")],
+        )
         for date_row, col, d in date_cells_in_grid(grid):
-            for start, end in [("7:00 AM", "3:30 PM"), ("3:30 PM", "12:00 AM")]:
+            for start, end in shift_windows:
                 block = find_shift_block(grid, date_row, col, start, end)
                 if not block:
                     continue
