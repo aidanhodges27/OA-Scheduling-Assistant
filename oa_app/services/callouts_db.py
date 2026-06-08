@@ -167,3 +167,94 @@ def sum_callout_hours_for_week(*, caller_name: str, week_start: date, week_end: 
         except Exception:
             pass
     return float(total)
+
+def list_open_summer_callouts(*, today: date | None = None) -> list[dict[str, Any]]:
+    """
+    Return future/current SUMMER callouts that are not fully covered by pickups.
+
+    A summer callout is considered covered when pickups for the same target,
+    date, and overlapping time cover the whole callout window.
+    """
+    if not supabase_callouts_enabled():
+        return []
+
+    today = today or date.today()
+    sb = get_supabase()
+
+    callout_resp = with_retry(
+        lambda: sb.table("callouts")
+        .select("*")
+        .eq("campus", "SUMMER")
+        .gte("event_date", str(today))
+        .execute()
+    )
+    pickup_resp = with_retry(
+        lambda: sb.table("pickups")
+        .select("*")
+        .eq("campus", "SUMMER")
+        .gte("event_date", str(today))
+        .execute()
+    )
+
+    callouts: list[dict[str, Any]] = list(getattr(callout_resp, "data", None) or [])
+    pickups: list[dict[str, Any]] = list(getattr(pickup_resp, "data", None) or [])
+
+    def _window(row: dict[str, Any]) -> tuple[datetime, datetime] | None:
+        sdt = _parse_iso_dt(row.get("shift_start_at"))
+        edt = _parse_iso_dt(row.get("shift_end_at"))
+        if not (sdt and edt):
+            return None
+        if edt <= sdt:
+            edt = edt + timedelta(days=1)
+        return sdt, edt
+
+    open_rows: list[dict[str, Any]] = []
+
+    for c in callouts:
+        c_window = _window(c)
+        if not c_window:
+            continue
+
+        c_start, c_end = c_window
+        total_mins = max(0.0, (c_end - c_start).total_seconds() / 60.0)
+        if total_mins <= 0:
+            continue
+
+        caller_key = name_key(str(c.get("caller_name", "")))
+        event_date = str(c.get("event_date", ""))
+
+        covered_mins = 0.0
+
+        for p in pickups:
+            if str(p.get("event_date", "")) != event_date:
+                continue
+
+            if name_key(str(p.get("target_name", ""))) != caller_key:
+                continue
+
+            p_window = _window(p)
+            if not p_window:
+                continue
+
+            p_start, p_end = p_window
+
+            overlap_start = max(c_start, p_start)
+            overlap_end = min(c_end, p_end)
+            if overlap_end > overlap_start:
+                covered_mins += (overlap_end - overlap_start).total_seconds() / 60.0
+
+        # Leave a tiny tolerance for rounding.
+        if covered_mins + 0.5 < total_mins:
+            row = dict(c)
+            row["covered_minutes"] = covered_mins
+            row["uncovered_minutes"] = max(0.0, total_mins - covered_mins)
+            open_rows.append(row)
+
+    open_rows.sort(
+        key=lambda r: (
+            str(r.get("event_date", "")),
+            str(r.get("shift_start_at", "")),
+            str(r.get("caller_name", "")),
+        )
+    )
+    return open_rows

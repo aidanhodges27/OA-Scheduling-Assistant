@@ -457,9 +457,9 @@ def _approver_identity_key(canon_name: str) -> str | None:
     # Canonical identities
     vraj = name_key("vraj patel")
     kat = name_key("kat brosvik")
-    nile = name_key("nile bernal")
     andy = name_key("barth andrew")
     jaden = name_key("schutt jaden")
+    aidan = name_key("aidan hodges")
 
     aliases = {
         # Vraj
@@ -467,8 +467,6 @@ def _approver_identity_key(canon_name: str) -> str | None:
         # Kat (allow "Kat" prefix / roster variants)
         kat: kat,
         name_key("kat"): kat,
-        # Nile
-        nile: nile,
         # Andy / Andrew Barth
         andy: andy,
         name_key("andrew barth"): andy,
@@ -477,6 +475,9 @@ def _approver_identity_key(canon_name: str) -> str | None:
         jaden: jaden,
         name_key("jaden schutt"): jaden,
         name_key("jaden"): jaden,
+        # Aidan / Aidan Hodges
+        aidan: aidan,
+        name_key("aidan"): aidan,
     }
 
     if nk in aliases:
@@ -497,9 +498,9 @@ def _is_approver(canon_name: str) -> bool:
     return ident in {
         name_key("vraj patel"),
         name_key("kat brosvik"),
-        name_key("nile bernal"),
         name_key("barth andrew"),
         name_key("schutt jaden"),
+        name_key("aidan hodges"),
     }
 
 
@@ -1718,64 +1719,156 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
                                 "sheet": b["sheet"],
                             }
                             st.rerun()
-        # Load cached tradeboards (guard against transient Google/network/quota errors)
-        def _safe_tradeboard(tab_title: str, ver: int, campus: str) -> dict:
-            try:
-                return pickup_scan.cached_tradeboard(ss.id, tab_title, ver, campus)
-            except Exception as e:
-                # Friendly recovery for transient quota/network errors (internet off, DNS, timeouts, etc.)
-                if maybe_show_recovery_popup(e, where=f"loading {campus} tradeboard"):
-                    return {"df": None, "windows": []}
-                return {"df": None, "windows": []}
-
-        data_unh = _safe_tradeboard(tab_unh or "", v_unh, "UNH") if tab_unh else {"df": None, "windows": []}
-        data_mc = _safe_tradeboard(tab_mc or "", v_mc, "MC") if tab_mc else {"df": None, "windows": []}
-
-        data_oc_list: list[tuple[str, dict]] = []
-        for oc in tabs_oc:
-            data_oc_list.append((oc, _safe_tradeboard(oc, v_oc_map.get(oc, 0), "ONCALL")))
-
+        # Load pickup windows.
+        #
+        # School-year mode:
+        #   Scan red cells from UNH / MC / On-Call sheet layouts.
+        #
+        # Summer mode:
+        #   Read open callouts from Supabase instead. Summer month tabs use a
+        #   different layout, so the old red-cell scanner cannot reliably find them.
         wins: list[pickup_scan.PickupWindow] = []
-        wins.extend(_pickup_windows_from_cached(data_unh.get("windows") or []))
-        wins.extend(_pickup_windows_from_cached(data_mc.get("windows") or []))
-        for _, d in data_oc_list:
-            wins.extend(_pickup_windows_from_cached(d.get("windows") or []))
 
-        count_unh = len(_pickup_windows_from_cached(data_unh.get("windows") or []))
-        count_mc = len(_pickup_windows_from_cached(data_mc.get("windows") or []))
-        count_oc = sum(len(_pickup_windows_from_cached(d.get("windows") or [])) for _, d in data_oc_list)
+        if getattr(config, "SUMMER_MODE", False):
+            from ..services import callouts_db
 
-        t1, t2, t3 = st.tabs([f"UNH ({count_unh})", f"MC ({count_mc})", f"On-Call ({count_oc})"])
-        with t1:
-            if tab_unh:
-                _render_tradeboard_v2("UNH", data_unh.get("df"), _pickup_windows_from_cached(data_unh.get("windows") or []))
-            else:
-                st.info("No UNH tab visible.")
-        with t2:
-            if tab_mc:
-                _render_tradeboard_v2("MC", data_mc.get("df"), _pickup_windows_from_cached(data_mc.get("windows") or []))
-            else:
-                st.info("No MC tab visible.")
-        with t3:
-            if not tabs_oc:
-                st.info("No On-Call tabs visible.")
-            else:
-                any_shown = False
-                for oc_title, oc_data in data_oc_list:
-                    oc_wins = _pickup_windows_from_cached(oc_data.get("windows") or [])
-                    if not oc_wins:
-                        continue  # Mode A: skip weeks with no red call-outs
-                    any_shown = True
-                    # Use explicit HTML line break so we never render a literal "\\n".
-                    st.markdown(
-                        f"**{oc_title}**<br>{len(oc_wins)} called-out block(s)",
-                        unsafe_allow_html=True,
+            try:
+                today_la = datetime.now(tz=ZoneInfo("America/Los_Angeles")).date()
+                summer_rows = callouts_db.list_open_summer_callouts(today=today_la)
+            except Exception as e:
+                summer_rows = []
+                st.warning(f"Could not load summer pickup board from Supabase: {_strip_debug_blob(str(e))}")
+
+            for row in summer_rows:
+                try:
+                    sdt = _parse_iso_dt(str(row.get("shift_start_at") or ""))
+                    edt = _parse_iso_dt(str(row.get("shift_end_at") or ""))
+                    if not (sdt and edt):
+                        continue
+
+                    if sdt.tzinfo is not None:
+                        sdt = sdt.astimezone(ZoneInfo("America/Los_Angeles")).replace(tzinfo=None)
+                    if edt.tzinfo is not None:
+                        edt = edt.astimezone(ZoneInfo("America/Los_Angeles")).replace(tzinfo=None)
+
+                    if edt <= sdt:
+                        edt = edt + timedelta(days=1)
+
+                    caller = str(row.get("caller_name") or "").strip()
+                    if not caller:
+                        continue
+
+                    day_canon = sdt.strftime("%A").lower()
+
+                    wins.append(
+                        pickup_scan.PickupWindow(
+                            campus_title="Summer",
+                            kind="SUMMER",
+                            day_canon=day_canon,
+                            target_name=caller,
+                            start=sdt,
+                            end=edt,
+                        )
                     )
-                    _render_tradeboard_v2("ONCALL", oc_data.get("df"), oc_wins)
-                    st.markdown("---")
-                if not any_shown:
-                    st.info("No red call-outs found on any On-Call week tabs.")
+                except Exception:
+                    continue
 
+            tab_summer = st.tabs([f"Summer ({len(wins)})"])[0]
+            with tab_summer:
+                if not wins:
+                    st.info("No open summer call-outs found.")
+                else:
+                    for i, w in enumerate(wins):
+                        card_key = f"summer_pickup_{i}_{w.target_name}_{w.start.isoformat()}"
+
+                        st.markdown(
+                            f"""
+                            <div class='tb2-card'>
+                              <div class='tb2-top'>
+                                <div class='tb2-time'>{w.start.strftime('%a %-m/%-d/%Y')} • {fmt_time(w.start)}–{fmt_time(w.end)}</div>
+                                <div class='tb2-badge oncall'>Summer</div>
+                              </div>
+                              <div class='tb2-sub'>Called out by</div>
+                              <div class='tb2-names'>{w.target_name}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                        if st.button("Pick up", key=card_key, use_container_width=True):
+                            event_date = w.start.date()
+                            summer_sheet_title = event_date.strftime("%B")
+
+                            st.session_state["TB2_MODAL"] = {
+                                "target": w.target_name,
+                                "names": [w.target_name],
+                                "day": w.day_canon,
+                                "kind": "SUMMER",
+                                "start": w.start.isoformat(),
+                                "end": w.end.isoformat(),
+                                "sheet": summer_sheet_title,
+                                "event_date": event_date.isoformat(),
+                                }
+                            
+                            st.rerun()
+
+        else:
+            # Load cached tradeboards (guard against transient Google/network/quota errors)
+            def _safe_tradeboard(tab_title: str, ver: int, campus: str) -> dict:
+                try:
+                    return pickup_scan.cached_tradeboard(ss.id, tab_title, ver, campus)
+                except Exception as e:
+                    # Friendly recovery for transient quota/network errors (internet off, DNS, timeouts, etc.)
+                    if maybe_show_recovery_popup(e, where=f"loading {campus} tradeboard"):
+                        return {"df": None, "windows": []}
+                    return {"df": None, "windows": []}
+
+            data_unh = _safe_tradeboard(tab_unh or "", v_unh, "UNH") if tab_unh else {"df": None, "windows": []}
+            data_mc = _safe_tradeboard(tab_mc or "", v_mc, "MC") if tab_mc else {"df": None, "windows": []}
+
+            data_oc_list: list[tuple[str, dict]] = []
+            for oc in tabs_oc:
+                data_oc_list.append((oc, _safe_tradeboard(oc, v_oc_map.get(oc, 0), "ONCALL")))
+
+            wins.extend(_pickup_windows_from_cached(data_unh.get("windows") or []))
+            wins.extend(_pickup_windows_from_cached(data_mc.get("windows") or []))
+            for _, d in data_oc_list:
+                wins.extend(_pickup_windows_from_cached(d.get("windows") or []))
+
+            count_unh = len(_pickup_windows_from_cached(data_unh.get("windows") or []))
+            count_mc = len(_pickup_windows_from_cached(data_mc.get("windows") or []))
+            count_oc = sum(len(_pickup_windows_from_cached(d.get("windows") or [])) for _, d in data_oc_list)
+
+            t1, t2, t3 = st.tabs([f"UNH ({count_unh})", f"MC ({count_mc})", f"On-Call ({count_oc})"])
+            with t1:
+                if tab_unh:
+                    _render_tradeboard_v2("UNH", data_unh.get("df"), _pickup_windows_from_cached(data_unh.get("windows") or []))
+                else:
+                    st.info("No UNH tab visible.")
+            with t2:
+                if tab_mc:
+                    _render_tradeboard_v2("MC", data_mc.get("df"), _pickup_windows_from_cached(data_mc.get("windows") or []))
+                else:
+                    st.info("No MC tab visible.")
+            with t3:
+                if not tabs_oc:
+                    st.info("No On-Call tabs visible.")
+                else:
+                    any_shown = False
+                    for oc_title, oc_data in data_oc_list:
+                        oc_wins = _pickup_windows_from_cached(oc_data.get("windows") or [])
+                        if not oc_wins:
+                            continue  # Mode A: skip weeks with no red call-outs
+                        any_shown = True
+                        # Use explicit HTML line break so we never render a literal "\\n".
+                        st.markdown(
+                            f"**{oc_title}**<br>{len(oc_wins)} called-out block(s)",
+                            unsafe_allow_html=True,
+                        )
+                        _render_tradeboard_v2("ONCALL", oc_data.get("df"), oc_wins)
+                        st.markdown("---")
+                    if not any_shown:
+                        st.info("No red call-outs found on any On-Call week tabs.")
 
 
         # --- Popup behavior for card "Pick up" buttons ---
@@ -1861,8 +1954,63 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
                             dur_pick = st.selectbox("Cover length (30-min steps)", dur_labels, index=len(dur_labels)-1, key=f"tb2m_dur_{mid}")
                             mins = dur_opts[dur_labels.index(dur_pick)]
                             req_e = req_s + timedelta(minutes=int(mins))
+                elif kind == "SUMMER":
+                    st.info("Summer pickups are for the full shift.")
                 else:
                     st.info("On-Call pickups are for the full block.")
+
+                # Summer pickups are full-shift and date-based.
+                # Bypass the old UNH/MC/On-Call labor-window scanner because summer
+                # callouts come from Supabase, not from the old red-cell scanner.
+                if kind == "SUMMER":
+                    st.info("Summer pickups are for the full shift.")
+
+                    if utils.name_key(canon_user) == utils.name_key(target):
+                        st.error("You cannot pick up your own callout.")
+                        if st.button("Close", key=f"tb2m_close_own_summer_{mid}"):
+                            st.session_state.pop("TB2_MODAL", None)
+                            st.rerun()
+                        return
+
+                    st.write(
+                        f"**Request:** {target} — "
+                        f"{win_start.strftime('%A %-m/%-d/%Y')} "
+                        f"{fmt_time(req_s)}–{fmt_time(req_e)} (Summer)"
+                    )
+
+                    if st.button("Send for approval", type="secondary", key=f"tb2m_send_summer_{mid}", use_container_width=True):
+                        try:
+                            event_d = win_start.date()
+                            summer_sheet_title = event_d.strftime("%B")
+                            details = f"target={target} | date={event_d.isoformat()} | source=summer"
+
+                            with st.spinner("Submitting request..."):
+                                submit_approval_request(
+                                    ss,
+                                    requester=canon_user,
+                                    action="pickup",
+                                    campus="SUMMER",
+                                    day=event_d.strftime("%A"),
+                                    start=fmt_time(req_s),
+                                    end=fmt_time(req_e),
+                                    details=_attach_details_meta(
+                                        details=details,
+                                        campus_key="SUMMER",
+                                        sheet_title=summer_sheet_title,
+                                        sheet_gid=_sheet_gid_for_title(schedule_global, summer_sheet_title),
+                                    ),
+                                )
+
+                            st.session_state["APPROVALS_EPOCH"] = st.session_state.get("APPROVALS_EPOCH", 0) + 1
+                            st.session_state.pop("TB2_MODAL", None)
+                            _flash("success", "Summer pickup request submitted for approval.")
+                            st.rerun()
+                        except Exception as e:
+                            if maybe_show_recovery_popup(e, where="submitting summer pickup approval request"):
+                                return
+                            st.error(_strip_debug_blob(str(e)))
+
+                    return
 
                 st.write(f"**Request:** {target} — {day_canon.title()} {fmt_time(req_s)}–{fmt_time(req_e)}")
 
@@ -2038,6 +2186,12 @@ div[data-testid="column"] div.stButton>button { border-radius:12px; }
         _modal_payload = st.session_state.get("TB2_MODAL")
         if _modal_payload:
             _open_tb2_pickup_dialog(_modal_payload)
+
+        if getattr(config, "SUMMER_MODE", False):
+            st.markdown("---")
+            st.subheader("Pick up a called-out shift")
+            st.caption("Use the Summer pickup cards above to request called-out summer shifts.")
+            return
 
         st.markdown("---")
         st.subheader("Pick up a called-out shift")
@@ -2910,6 +3064,18 @@ def run() -> None:
                 details=details,
             )
 
+            if getattr(config, "SUMMER_MODE", False):
+                    meta_for_sheet, details_for_sheet = _extract_details_meta(details)
+                    kv_for_sheet = _parse_details_kv(details_for_sheet)
+                    
+                    if str(meta_for_sheet.get("campus_key", "")).upper() == "SUMMER" or str(campus).upper() == "SUMMER":
+                        ds_for_sheet = str(kv_for_sheet.get("date", "")).strip()
+                        if ds_for_sheet:
+                            try:
+                                campus_ws_title = date.fromisoformat(ds_for_sheet).strftime("%B")
+                            except Exception:
+                                pass
+
             if action == "add":
                 return chat_add.handle_add(
                     st,
@@ -2997,7 +3163,7 @@ def run() -> None:
                             {
                                 "approval_id": approval_id,
                                 "submitted_at": created_at,
-                                "campus": "ONCALL" if campus_key not in {"UNH", "MC"} else campus_key,
+                                "campus": "SUMMER" if campus_key == "SUMMER" else ("ONCALL" if campus_key not in {"UNH", "MC"} else campus_key),
                                 "caller_name": requester,
                                 "reason": reason,
                                 "event_date": str(event_d),
@@ -3092,6 +3258,18 @@ def run() -> None:
 
                 should_color_now = _should_color_schedule_now(campus_key=campus_key, event_d=event_d)
 
+                if getattr(config, "SUMMER_MODE", False) and campus_key == "SUMMER":
+                    should_color_now = True
+
+                pickup_start_arg = sdt.time()
+                pickup_end_arg = edt.time()
+
+                if campus_key == "SUMMER":
+                    pickup_start_arg = _combine_date_time_la(event_d, sdt.time())
+                    pickup_end_arg = _combine_date_time_la(event_d, edt.time())
+                    if pickup_end_arg <= pickup_start_arg:
+                        pickup_end_arg = pickup_end_arg + timedelta(days=1)
+
                 if should_color_now:
                     msg = chat_callout.handle_callout(
                         st,
@@ -3100,13 +3278,12 @@ def run() -> None:
                         canon_target_name=target,
                         campus_title=campus_ws_title,
                         day=day_canon,
-                        start=sdt.time(),
-                        end=edt.time(),
+                        start=pickup_start_arg,
+                        end=pickup_end_arg,
                         covered_by=requester,
                     )
                 else:
                     msg = "Logged future pickup (no schedule color change)."
-
                 # Upsert into Supabase pickups table (idempotent). Supabase is the source of truth.
                 start_at = _combine_date_time_la(event_d, sdt.time())
                 end_at = _combine_date_time_la(event_d, edt.time())
@@ -3122,7 +3299,7 @@ def run() -> None:
                             {
                                 "approval_id": approval_id,
                                 "submitted_at": created_at,
-                                "campus": "ONCALL" if campus_key not in {"UNH", "MC"} else campus_key,
+                                "campus": "SUMMER" if campus_key == "SUMMER" else ("ONCALL" if campus_key not in {"UNH", "MC"} else campus_key),
                                 "event_date": str(event_d),
                                 "shift_start_at": start_at.isoformat(timespec="seconds"),
                                 "shift_end_at": end_at.isoformat(timespec="seconds"),
