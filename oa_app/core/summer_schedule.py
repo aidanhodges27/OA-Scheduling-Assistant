@@ -472,7 +472,10 @@ def mark_person_callout(
     person_key = _norm_name(person_name)
 
     for rr, existing in get_shift_people(grid, col, r_label, r_next):
-        if _norm_name(existing) == person_key:
+        existing_key = _norm_name(existing)
+
+        # Exact match first, then loose containment for cells like:
+        if existing_key == person_key or person_key in existing_key:
             color = _ORANGE if covered_by else _RED
 
             ws.spreadsheet.batch_update(
