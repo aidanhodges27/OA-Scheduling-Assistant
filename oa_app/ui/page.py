@@ -3064,17 +3064,25 @@ def run() -> None:
                 details=details,
             )
 
+            is_summer_request = False
+
             if getattr(config, "SUMMER_MODE", False):
-                    meta_for_sheet, details_for_sheet = _extract_details_meta(details)
-                    kv_for_sheet = _parse_details_kv(details_for_sheet)
-                    
-                    if str(meta_for_sheet.get("campus_key", "")).upper() == "SUMMER" or str(campus).upper() == "SUMMER":
-                        ds_for_sheet = str(kv_for_sheet.get("date", "")).strip()
-                        if ds_for_sheet:
-                            try:
-                                campus_ws_title = date.fromisoformat(ds_for_sheet).strftime("%B")
-                            except Exception:
-                                pass
+                meta_for_sheet, details_for_sheet = _extract_details_meta(details)
+                kv_for_sheet = _parse_details_kv(details_for_sheet)
+
+                is_summer_request = (
+                    str(meta_for_sheet.get("campus_key", "")).upper() == "SUMMER"
+                    or str(campus).upper() == "SUMMER"
+                    or str(kv_for_sheet.get("source", "")).lower() == "summer"
+                )
+
+                if is_summer_request:
+                    ds_for_sheet = str(kv_for_sheet.get("date", "")).strip()
+                    if ds_for_sheet:
+                        try:
+                            campus_ws_title = date.fromisoformat(ds_for_sheet).strftime("%B")
+                        except Exception:
+                           pass
 
             if action == "add":
                 return chat_add.handle_add(
@@ -3105,6 +3113,14 @@ def run() -> None:
 
                 campus_key = utils.normalize_campus(campus_ws_title, campus)
                 kv = _parse_details_kv(details_rest)
+
+                if getattr(config, "SUMMER_MODE", False) and (
+                    is_summer_request
+                    or str(campus).upper() == "SUMMER"
+                    or str(kv.get("source", "")).lower() == "summer"
+                ):
+                    campus_key = "SUMMER"
+
                 reason = kv.get("reason")
 
                 # Event date derivation:
@@ -3235,6 +3251,13 @@ def run() -> None:
                 target = m.group(1).strip()
                 campus_key = utils.normalize_campus(campus_ws_title, campus)
                 kv = _parse_details_kv(details_rest)
+
+                if getattr(config, "SUMMER_MODE", False) and (
+                    is_summer_request
+                    or str(campus).upper() == "SUMMER"
+                    or str(kv.get("source", "")).lower() == "summer"
+                ):
+                    campus_key = "SUMMER"
 
                 # Event date derivation:
                 ds = (kv.get("date") or "").strip()
@@ -4336,11 +4359,16 @@ def run() -> None:
                                 from ..jobs.sync_swaps_to_sheets import sync_swaps_to_sheets
 
                                 sb = get_supabase()
+
+                                # In summer mode, active_tab can be misleading depending on what the UI selected.
+                                # Use the actual event date to target the correct month tab.
+                                sync_sheet_title = event_d.strftime("%B") if getattr(config, "SUMMER_MODE", False) else active_tab
+
                                 ws_obj = None
                                 try:
                                     if hasattr(schedule_global, "_load_ws_map"):
                                         schedule_global._load_ws_map()  # type: ignore[attr-defined]
-                                        ws_obj = getattr(schedule_global, "_ws_map", {}).get(active_tab)
+                                        ws_obj = getattr(schedule_global, "_ws_map", {}).get(sync_sheet_title)
                                 except Exception:
                                     ws_obj = None
 
@@ -4348,15 +4376,21 @@ def run() -> None:
                                     ss,
                                     sb,
                                     worksheet=ws_obj,
-                                    sheet_title=active_tab,
+                                    sheet_title=sync_sheet_title,
                                     apply_grid_colors=True,
                                 )
+
+                                sheet_errs = res.get("sheet_errors") or []
                                 grid_errs = res.get("grid_errors") or []
+
+                                if sheet_errs:
+                                    st.warning(f"Swap section sync had errors. First error: {sheet_errs[0]}")
                                 if grid_errs:
                                     st.warning(f"Swap grid sync had issues. First issue: {grid_errs[0]}")
-                            except Exception as e:
-                                st.warning(f"Callout recorded, but swap section sync failed: {_strip_debug_blob(str(e))}")
 
+                            except Exception as e:
+                             st.warning(f"Callout recorded, but swap section sync failed: {_strip_debug_blob(str(e))}")
+                             
                         try:
                             append_audit(
                                 ss,
