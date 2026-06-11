@@ -35,6 +35,7 @@ from ..integrations.gspread_io import with_backoff
 from ..core.sheets_sections import Section, blanks, compute_section, pad_rows
 from ..core.week_range import la_today, week_range_from_title
 from ..core import utils
+from .. import config
 
 
 LA = ZoneInfo("America/Los_Angeles")
@@ -884,6 +885,8 @@ def _ensure_fixed_headers(ws: gspread.Worksheet) -> tuple[Section, Section]:
 
 def _campus_key_for_sheet_title(title: str) -> str:
     tl = (title or "").strip().lower()
+    if getattr(config, "SUMMER_MODE", False) and tl in {"may", "june", "july", "august"}:
+        return "SUMMER"
     if re.search(r"\bon\s*[- ]?\s*call\b", tl) or "oncall" in tl:
         return "ONCALL"
     return utils.normalize_campus(title, "UNH")
@@ -903,6 +906,8 @@ def _should_auto_sync_worksheet(ws: gspread.Worksheet) -> bool:
     tl = (getattr(ws, "title", "") or "").strip().lower()
     if tl in {"(names of hired oas)", "eo schedule policies", "audit log", "_locks"}:
         return False
+    if getattr(config, "SUMMER_MODE", False):
+        return tl in {"may", "june", "july", "august"}
     return bool("(oa and goas)" in tl or re.search(r"\bon\s*[- ]?call\b", tl))
 
 
@@ -918,6 +923,27 @@ def _bucket_window_for_sheet(title: str, *, today: date) -> tuple[date, date, bo
     should not carry other On-Call weeks into the future column.
     """
     campus_key = _campus_key_for_sheet_title(title)
+    if campus_key == "SUMMER":
+        month_by_name = {
+            "may": 5,
+            "june": 6,
+            "july": 7,
+            "august": 8,
+        }
+
+        month_num = month_by_name.get((title or "").strip().lower())
+        if month_num:
+            year = today.year
+            start = date(year, month_num, 1)
+
+            if month_num == 12:
+                end = date(year + 1, 1, 1) - timedelta(days=1)
+            else:
+                end = date(year, month_num + 1, 1) - timedelta(days=1)
+
+            # For summer month tabs, treat the whole visible month as the weekly/current section.
+            # This puts the pickup/callout list under "Shift Swaps for the week" in column I.
+            return start, end, False
     if campus_key == "ONCALL":
         try:
             wr = week_range_from_title(str(title or ""), today=today)
