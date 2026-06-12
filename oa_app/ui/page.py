@@ -586,6 +586,108 @@ def _flash(kind: str, msg: str) -> None:
 
 
 @st.cache_data(ttl=30, show_spinner=False)
+
+def _remove_called_out_shifts_from_user_sched(user_sched: dict, canon_name: str) -> dict:
+    """
+    Remove shifts from the visible user schedule if that user has called out
+    of the same date/start/end in Supabase.
+
+    This is mainly needed for summer mode because the sheet keeps the caller's
+    name in the cell and only changes the cell color to red/orange.
+    """
+    if not getattr(config, "SUMMER_MODE", False):
+        return user_sched or {}
+
+    try:
+        if not callouts_db.supabase_callouts_enabled():
+            return user_sched or {}
+    except Exception:
+        return user_sched or {}
+
+    # Collect all dates currently present in this user's parsed schedule.
+    dates: list[date] = []
+    for _day, buckets in (user_sched or {}).items():
+        for _src, blocks in (buckets or {}).items():
+            for block in blocks or []:
+                if isinstance(block, dict) and block.get("date"):
+                    try:
+                        dates.append(date.fromisoformat(str(block["date"])))
+                    except Exception:
+                        pass
+
+    if not dates:
+        return user_sched or {}
+
+    start_d = min(dates)
+    end_d = max(dates)
+
+    try:
+        rows = callouts_db.list_callouts_for_week(
+            caller_name=canon_name,
+            week_start=start_d,
+            week_end=end_d,
+        )
+    except Exception:
+        return user_sched or {}
+
+    called_out_keys: set[tuple[str, str, str]] = set()
+
+    for row in rows or []:
+        try:
+            event_d = date.fromisoformat(str(row.get("event_date")))
+        except Exception:
+            continue
+
+        sdt = _parse_iso_datetime_la(str(row.get("shift_start_at") or ""))
+        edt = _parse_iso_datetime_la(str(row.get("shift_end_at") or ""))
+        if not (sdt and edt):
+            continue
+
+        called_out_keys.add(
+            (
+                event_d.isoformat(),
+                fmt_time(sdt),
+                fmt_time(edt),
+            )
+        )
+
+    if not called_out_keys:
+        return user_sched or {}
+
+    filtered: dict = {}
+
+    for day, buckets in (user_sched or {}).items():
+        filtered[day] = {}
+
+        for src, blocks in (buckets or {}).items():
+            kept = []
+
+            for block in blocks or []:
+                pair = schedule_query._extract_time_pair(block)
+                if not pair:
+                    kept.append(block)
+                    continue
+
+                s_txt, e_txt = pair
+                block_date = None
+
+                if isinstance(block, dict) and block.get("date"):
+                    try:
+                        block_date = date.fromisoformat(str(block["date"]))
+                    except Exception:
+                        block_date = None
+
+                if block_date:
+                    key = (block_date.isoformat(), s_txt, e_txt)
+                    if key in called_out_keys:
+                        continue
+
+                kept.append(block)
+
+            filtered[day][src] = kept
+
+    return filtered
+
 def cached_user_schedule(ss_id: str, canon_name: str, epoch):
     ss = st.session_state.get("_SS_HANDLE_BY_ID", {}).get(ss_id)
     if not ss:
@@ -594,6 +696,7 @@ def cached_user_schedule(ss_id: str, canon_name: str, epoch):
     if not schedule_global:
         return {}
     sched = schedule_query.get_user_schedule(ss, schedule_global, canon_name)
+    sched = _remove_called_out_shifts_from_user_sched(sched or {}, canon_name)
     return sched or {}
 
 
@@ -620,6 +723,7 @@ def cached_user_schedule_for_titles(
         mc_title=mc_title,
         oncall_title=oncall_title,
     )
+    sched = _remove_called_out_shifts_from_user_sched(sched or {}, canon_name)
     return sched or {}
 
 
@@ -4377,7 +4481,7 @@ def run() -> None:
                                     sb,
                                     worksheet=ws_obj,
                                     sheet_title=sync_sheet_title,
-                                    apply_grid_colors=True,
+                                    apply_grid_colors=False,
                                 )
 
                                 sheet_errs = res.get("sheet_errors") or []
@@ -4390,7 +4494,7 @@ def run() -> None:
 
                             except Exception as e:
                              st.warning(f"Callout recorded, but swap section sync failed: {_strip_debug_blob(str(e))}")
-                             
+
                         try:
                             append_audit(
                                 ss,
