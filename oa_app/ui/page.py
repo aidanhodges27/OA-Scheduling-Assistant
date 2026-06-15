@@ -77,6 +77,23 @@ def _week_bounds_la(ref: date | None = None) -> tuple[date, date]:
     saturday = sunday + timedelta(days=6)
     return sunday, saturday
 
+def _selected_schedule_week_bounds() -> tuple[date, date]:
+    """
+    Week currently selected in the schedule chart.
+    Uses schedule_week_offset, where 0 = current week.
+    """
+    today = week_range_mod.la_today()
+    current_week_start = today - timedelta(days=((today.weekday() + 1) % 7))
+
+    try:
+        offset = int(st.session_state.get("schedule_week_offset", 0))
+    except Exception:
+        offset = 0
+
+    week_start = current_week_start + timedelta(days=7 * offset)
+    week_end = week_start + timedelta(days=6)
+    return week_start, week_end
+
 
 def _should_color_schedule_now(*, campus_key: str, event_d: date) -> bool:
     """Whether a schedule-grid write should happen immediately.
@@ -2819,7 +2836,10 @@ def run() -> None:
                 # - The BIG number should match the schedule chart/table (raw scheduled hours from Sheets).
                 # - If Supabase is configured, we also show an *adjusted* total after approved callouts/pickups.
                 #   (Users found it confusing when the main number didn't match the schedule table.)
-                ws, we = _week_bounds_la()
+                if getattr(config, "SUMMER_MODE", False):
+                    ws, we = _selected_schedule_week_bounds()
+                else:
+                    ws, we = _week_bounds_la()
                 scheduled_h = float(hours_now)
                 callout_h = pickup_h = 0.0
                 adjusted_h = scheduled_h
@@ -3835,13 +3855,7 @@ def run() -> None:
                     if "schedule_week_offset" not in st.session_state:
                         st.session_state["schedule_week_offset"] = 0
 
-                    today = week_range_mod.la_today()
-                    current_week_start = today - timedelta(days=((today.weekday() + 1) % 7))
-
-                    selected_week_start = current_week_start + timedelta(
-                        days=7 * int(st.session_state["schedule_week_offset"])
-                    )
-                    selected_week_end = selected_week_start + timedelta(days=6)
+                    selected_week_start, selected_week_end = _selected_schedule_week_bounds()
 
                     c_prev, c_label, c_next = st.columns([1, 2, 1])
 
@@ -3864,7 +3878,7 @@ def run() -> None:
                             st.rerun() 
                 schedule_query.render_schedule_viz(
                         st,
-                        df_sched,
+                        df_cached,
                         title=(
                             f"{canon_name} — {selected_week_start.strftime('%b %-d')}–{selected_week_end.strftime('%b %-d')}"
                             if selected_week_start and selected_week_end
