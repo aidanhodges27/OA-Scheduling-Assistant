@@ -1337,7 +1337,13 @@ def build_schedule_dataframe(user_sched: Dict[str, Dict[str, List[Tuple[str, str
 
     return df
 
-def render_schedule_viz(st, df: pd.DataFrame, *, title: str = "This Week's Schedule"):
+def render_schedule_viz(
+    st,
+    df: pd.DataFrame,
+    *,
+    title: str = "This Week's Schedule",
+    week_start: date | None = None,
+):
     """
     Calendar view:
       • X-axis: Days (Sun → Sat) with day+date labels shown at the top
@@ -1355,8 +1361,10 @@ def render_schedule_viz(st, df: pd.DataFrame, *, title: str = "This Week's Sched
         from .. import config
 
         if getattr(config, "SUMMER_MODE", False) and "Date" in df.columns:
-            today = week_range_mod.la_today()
-            week_start = today - timedelta(days=((today.weekday() + 1) % 7))
+            if week_start is None:
+                today = week_range_mod.la_today()
+                week_start = today - timedelta(days=((today.weekday() + 1) % 7))
+
             week_end = week_start + timedelta(days=6)
 
             df = df[
@@ -1367,6 +1375,7 @@ def render_schedule_viz(st, df: pd.DataFrame, *, title: str = "This Week's Sched
             if df.empty:
                 st.info("No shifts found for your name this week.")
                 return
+                
     except Exception:
         pass
 
