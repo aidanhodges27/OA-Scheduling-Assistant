@@ -31,6 +31,7 @@ from ..services.roster import load_roster
 from ..services import callouts_db, pickups_db
 from . import schedule_query, ui_peek
 from . import pickup_scan
+import pandas as pd
 from .recovery import clear_hard_caches, maybe_show_recovery_popup
 from .footer import render_global_footer
 from .vibrant_theme import apply_vibrant_theme
@@ -239,10 +240,17 @@ def _combine_date_time_la(d: date, t) -> datetime:
     return datetime(d.year, d.month, d.day, int(hh), int(mm), tzinfo=ZoneInfo("America/Los_Angeles"))
 
 
-def _duration_hours_between(start_at: datetime, end_at: datetime) -> float:
+def _duration_hours_between(start_at: datetime, end_at: datetime, *, subtract_break: bool = False) -> float:
     if end_at <= start_at:
         end_at = end_at + timedelta(days=1)
-    return max(0.0, float((end_at - start_at).total_seconds() / 3600.0))
+
+    hours = max(0.0, float((end_at - start_at).total_seconds() / 3600.0))
+
+    # Summer shifts are 8.5 hours on the calendar but include a 30-minute break.
+    if subtract_break and hours >= 8.5:
+        hours -= 0.5
+
+    return max(0.0, hours)
 
 
 def _oncall_event_date(sheet_title: str, day_canon: str) -> date | None:
@@ -2840,7 +2848,35 @@ def run() -> None:
                     ws, we = _selected_schedule_week_bounds()
                 else:
                     ws, we = _week_bounds_la()
+                def _selected_week_schedule_hours(ss, canon_name: str, week_start: date, week_end: date) -> float:
+                    """
+                    Calculate visible scheduled hours for the selected week.
+                    Uses the same parsed/filtered schedule as the chart, so called-out shifts
+                    that were removed from the schedule view do not count.
+                    """
+                    try:
+                        epoch_key = st.session_state.get("UI_EPOCH", 0)
+                        user_sched = cached_user_schedule(ss.id, canon_name, epoch_key)
+                        df = cached_schedule_df(user_sched, epoch_key)
+
+                        if df is None or df.empty or "Date" not in df.columns:
+                            return 0.0
+
+                        mask = (
+                            (pd.to_datetime(df["Date"]).dt.date >= week_start)
+                            & (pd.to_datetime(df["Date"]).dt.date <= week_end)
+                        )
+                        week_df = df[mask].copy()
+
+                        if week_df.empty or "DurationMin" not in week_df.columns:
+                            return 0.0
+
+                        return round(float(week_df["DurationMin"].sum()) / 60.0, 2)
+                    except Exception:
+                        return 0.0
                 scheduled_h = float(hours_now)
+                if getattr(config, "SUMMER_MODE", False):
+                    scheduled_h = _selected_week_schedule_hours(ss, canon_tmp, ws, we)
                 callout_h = pickup_h = 0.0
                 adjusted_h = scheduled_h
                 if callouts_db.supabase_callouts_enabled() and pickups_db.supabase_pickups_enabled():
@@ -2856,15 +2892,19 @@ def run() -> None:
                     except Exception:
                         return str(d)
 
+                if getattr(config, "SUMMER_MODE", False):
+                    scheduled_h = _selected_week_schedule_hours(ss, canon_name, ws, we)
+                    adjusted_h = scheduled_h + pickup_h - callout_h
+
                 subtitle = f"Week: {_fmt_md(ws)}–{_fmt_md(we)}"
                 st.markdown(
                     f"""
                     <div class='oa-hours-card oa-hours-card--classic'>
                       <div class='oa-hours-card__label'>
-                        General hours <span class='oa-hours-card__scope'>(this week)</span>
+                        General hours <span class='oa-hours-card__scope'>(selected week)</span>
                       </div>
                       <div class='oa-hours-card__valueBig'>
-                        {scheduled_h:.1f} <span class='oa-hours-card__cap'>/ 20</span>
+                        {scheduled_h:.1f} <span class='oa-hours-card__cap'>/ 40</span>
                       </div>
                       <div class='oa-hours-card__subline'>
                         Adjusted (callouts/pickups): <b>{adjusted_h:.1f}</b>
@@ -3340,7 +3380,14 @@ def run() -> None:
                                 "event_date": str(event_d),
                                 "shift_start_at": start_at.isoformat(timespec="seconds"),
                                 "shift_end_at": end_at.isoformat(timespec="seconds"),
-                                "duration_hours": round(_duration_hours_between(start_at, end_at), 4),
+                                "duration_hours": round(
+                                    _duration_hours_between(
+                                        start_at,
+                                        end_at,
+                                        subtract_break=(campus_key == "SUMMER"),
+                                    ),
+                                    4,
+                                ),
                             }
                         )
                         db_ok = True
@@ -3481,7 +3528,14 @@ def run() -> None:
                                 "event_date": str(event_d),
                                 "shift_start_at": start_at.isoformat(timespec="seconds"),
                                 "shift_end_at": end_at.isoformat(timespec="seconds"),
-                                "duration_hours": round(_duration_hours_between(start_at, end_at), 4),
+                                "duration_hours": round(
+                                    _duration_hours_between(
+                                        start_at,
+                                        end_at,
+                                        subtract_break=(campus_key == "SUMMER"),
+                                    ),
+                                    4,
+                                ),
                                 "picker_name": requester,
                                 "target_name": target,
                                 "note": kv.get("note"),

@@ -1295,7 +1295,13 @@ def build_schedule_dataframe(user_sched: Dict[str, Dict[str, List[Tuple[str, str
                 if plot_end <= plot_start:
                     plot_end += timedelta(days=1)
 
-                dur_min = int((plot_end - plot_start).total_seconds() // 60)
+                raw_dur_min = int((plot_end - plot_start).total_seconds() // 60)
+                dur_min = raw_dur_min
+                
+                # Summer shifts are scheduled as 8.5-hour windows but include a 30-minute break.
+                # Count them as 8 paid/worked hours while still drawing the full time block.
+                if isinstance(block, dict) and block.get("source") == "Summer" and raw_dur_min >= 510:
+                    dur_min = raw_dur_min - 30
 
                 display_source = "Summer" if isinstance(block, dict) and block.get("source") == "Summer" else src
 
