@@ -2,13 +2,14 @@
 from __future__ import annotations
 import os
 import re
-from datetime import timedelta, datetime
+from datetime import date, timedelta, datetime
 from typing import Iterable, List, Optional, Tuple, Dict
 
 import streamlit as st
 import gspread
 import gspread.utils as a1
 
+from .. import config
 from ..config import (
     OA_SCHEDULE_SHEETS,   # ["UNH ...", "MC ..."]
     AUDIT_SHEET,
@@ -26,8 +27,24 @@ from . import week_range as week_range_mod
 # Debug controls (no-UI): secrets/env/session_state
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _hours_from_user_sched(user_sched: dict) -> float:
+def _current_la_week_bounds() -> tuple[date, date]:
+    today = week_range_mod.la_today()
+    week_start = today - timedelta(days=((today.weekday() + 1) % 7))
+    return week_start, week_start + timedelta(days=6)
+
+
+def _hours_from_user_sched(user_sched: dict, *, summer_week_only: bool = False) -> float:
+    """Sum scheduled hours from parsed user_sched buckets.
+
+    Supports legacy (start, end) tuples and summer dict blocks with a date field.
+    In summer mode, full shifts count as SUMMER_PAID_SHIFT_MINS (8h) when the
+    parsed span matches a full summer block (~8.5h scheduled).
+    """
     total_mins = 0
+    summer_mode = bool(getattr(config, "SUMMER_MODE", False))
+    paid_mins = int(getattr(config, "SUMMER_PAID_SHIFT_MINS", 8 * 60))
+    scheduled_mins = int(getattr(config, "SUMMER_SCHEDULED_SHIFT_MINS", 8 * 60 + 30))
+    week_start, week_end = _current_la_week_bounds()
 
     for buckets in (user_sched or {}).values():
         if not isinstance(buckets, dict):
@@ -36,10 +53,18 @@ def _hours_from_user_sched(user_sched: dict) -> float:
         for k in ("UNH", "MC", "On-Call"):
             for block in (buckets.get(k, []) or []):
                 s = e = None
+                block_date: date | None = None
+                is_summer = False
 
                 if isinstance(block, dict):
                     s = block.get("start") or block.get("s")
                     e = block.get("end") or block.get("e")
+                    is_summer = block.get("source") == "Summer"
+                    if block.get("date"):
+                        try:
+                            block_date = date.fromisoformat(str(block["date"]))
+                        except Exception:
+                            block_date = None
                 else:
                     try:
                         s, e = block[0], block[1]
@@ -49,7 +74,15 @@ def _hours_from_user_sched(user_sched: dict) -> float:
                 if not (s and e):
                     continue
 
-                total_mins += _mins_between_12h(str(s), str(e))
+                if summer_mode and summer_week_only and block_date is not None:
+                    if not (week_start <= block_date <= week_end):
+                        continue
+
+                span = _mins_between_12h(str(s), str(e))
+                if summer_mode and is_summer and span >= scheduled_mins - 15:
+                    total_mins += paid_mins
+                else:
+                    total_mins += span
 
     return float(total_mins) / 60.0
 
@@ -328,21 +361,6 @@ def _mins_between_12h(s: str, e: str) -> int:
     return int((ed - sd).total_seconds() // 60)
 
 
-def _hours_from_user_sched(user_sched: dict) -> float:
-    total_mins = 0
-    for buckets in (user_sched or {}).values():
-        if not isinstance(buckets, dict):
-            continue
-        for k in ("UNH", "MC", "On-Call"):
-            for pair in (buckets.get(k, []) or []):
-                try:
-                    s, e = pair
-                except Exception:
-                    continue
-                total_mins += _mins_between_12h(s, e)
-    return float(total_mins) / 60.0
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Cache-busting for strict recomputes
 # ──────────────────────────────────────────────────────────────────────────────
@@ -406,26 +424,35 @@ def compute_hours_fast(_ss, _schedule, canon_name: str, epoch) -> float:
     try:
         from ..ui import schedule_query
 
-        unh_title = titles[0] if len(titles) >= 1 else None
-        mc_title = titles[1] if len(titles) >= 2 else None
-        on_title = titles[2] if len(titles) >= 3 else None
+        summer_mode = bool(getattr(config, "SUMMER_MODE", False))
+        week_only = summer_mode
 
-        user_sched = schedule_query.get_user_schedule_for_titles(
-            _ss,
-            _schedule,
-            canon_name,
-            unh_title=unh_title,
-            mc_title=mc_title,
-            oncall_title=on_title,
-        )
-        h = _hours_from_user_sched(user_sched)
-        if h > 0:
-            return h
+        if summer_mode:
+            user_sched = schedule_query.get_user_schedule(_ss, _schedule, canon_name)
+            h = _hours_from_user_sched(user_sched, summer_week_only=week_only)
+            if h > 0:
+                return h
+        else:
+            unh_title = titles[0] if len(titles) >= 1 else None
+            mc_title = titles[1] if len(titles) >= 2 else None
+            on_title = titles[2] if len(titles) >= 3 else None
+
+            user_sched = schedule_query.get_user_schedule_for_titles(
+                _ss,
+                _schedule,
+                canon_name,
+                unh_title=unh_title,
+                mc_title=mc_title,
+                oncall_title=on_title,
+            )
+            h = _hours_from_user_sched(user_sched, summer_week_only=week_only)
+            if h > 0:
+                return h
 
         # Retry using the chart/table heuristic (open_three), which is often
         # more forgiving if a title couldn't be resolved in this run.
         user_sched2 = schedule_query.get_user_schedule(_ss, _schedule, canon_name)
-        h2 = _hours_from_user_sched(user_sched2)
+        h2 = _hours_from_user_sched(user_sched2, summer_week_only=week_only)
         if h2 > 0:
             return h2
 
@@ -481,25 +508,34 @@ def total_hours_from_unh_mc_and_neighbor(_ss: gspread.Spreadsheet, _schedule, ca
     try:
         from ..ui import schedule_query
 
-        unh_title = titles[0] if len(titles) >= 1 else None
-        mc_title = titles[1] if len(titles) >= 2 else None
-        on_title = titles[2] if len(titles) >= 3 else None
+        summer_mode = bool(getattr(config, "SUMMER_MODE", False))
+        week_only = summer_mode
 
-        user_sched = schedule_query.get_user_schedule_for_titles(
-            _ss,
-            _schedule,
-            canon_name,
-            unh_title=unh_title,
-            mc_title=mc_title,
-            oncall_title=on_title,
-        )
-        h = _hours_from_user_sched(user_sched)
-        if h > 0:
-            return h
+        if summer_mode:
+            user_sched = schedule_query.get_user_schedule(_ss, _schedule, canon_name)
+            h = _hours_from_user_sched(user_sched, summer_week_only=week_only)
+            if h > 0:
+                return h
+        else:
+            unh_title = titles[0] if len(titles) >= 1 else None
+            mc_title = titles[1] if len(titles) >= 2 else None
+            on_title = titles[2] if len(titles) >= 3 else None
+
+            user_sched = schedule_query.get_user_schedule_for_titles(
+                _ss,
+                _schedule,
+                canon_name,
+                unh_title=unh_title,
+                mc_title=mc_title,
+                oncall_title=on_title,
+            )
+            h = _hours_from_user_sched(user_sched, summer_week_only=week_only)
+            if h > 0:
+                return h
 
         # Retry using chart/table heuristic
         user_sched2 = schedule_query.get_user_schedule(_ss, _schedule, canon_name)
-        h2 = _hours_from_user_sched(user_sched2)
+        h2 = _hours_from_user_sched(user_sched2, summer_week_only=week_only)
         if h2 > 0:
             return h2
 

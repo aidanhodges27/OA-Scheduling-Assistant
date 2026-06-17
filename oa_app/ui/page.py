@@ -31,6 +31,7 @@ from ..services.roster import load_roster
 from ..services import callouts_db, pickups_db
 from . import schedule_query, ui_peek
 from . import pickup_scan
+import pandas as pd
 from .recovery import clear_hard_caches, maybe_show_recovery_popup
 from .footer import render_global_footer
 from .vibrant_theme import apply_vibrant_theme
@@ -76,6 +77,23 @@ def _week_bounds_la(ref: date | None = None) -> tuple[date, date]:
     sunday = d - timedelta(days=(d.weekday() + 1) % 7)
     saturday = sunday + timedelta(days=6)
     return sunday, saturday
+
+def _selected_schedule_week_bounds() -> tuple[date, date]:
+    """
+    Week currently selected in the schedule chart.
+    Uses schedule_week_offset, where 0 = current week.
+    """
+    today = week_range_mod.la_today()
+    current_week_start = today - timedelta(days=((today.weekday() + 1) % 7))
+
+    try:
+        offset = int(st.session_state.get("schedule_week_offset", 0))
+    except Exception:
+        offset = 0
+
+    week_start = current_week_start + timedelta(days=7 * offset)
+    week_end = week_start + timedelta(days=6)
+    return week_start, week_end
 
 
 def _should_color_schedule_now(*, campus_key: str, event_d: date) -> bool:
@@ -222,10 +240,17 @@ def _combine_date_time_la(d: date, t) -> datetime:
     return datetime(d.year, d.month, d.day, int(hh), int(mm), tzinfo=ZoneInfo("America/Los_Angeles"))
 
 
-def _duration_hours_between(start_at: datetime, end_at: datetime) -> float:
+def _duration_hours_between(start_at: datetime, end_at: datetime, *, subtract_break: bool = False) -> float:
     if end_at <= start_at:
         end_at = end_at + timedelta(days=1)
-    return max(0.0, float((end_at - start_at).total_seconds() / 3600.0))
+
+    hours = max(0.0, float((end_at - start_at).total_seconds() / 3600.0))
+
+    # Summer shifts are 8.5 hours on the calendar but include a 30-minute break.
+    if subtract_break and hours >= 8.5:
+        hours -= 0.5
+
+    return max(0.0, hours)
 
 
 def _oncall_event_date(sheet_title: str, day_canon: str) -> date | None:
@@ -585,15 +610,14 @@ def _flash(kind: str, msg: str) -> None:
     st.session_state["_FLASH"] = {"kind": kind, "msg": msg}
 
 
-@st.cache_data(ttl=30, show_spinner=False)
 
 def _remove_called_out_shifts_from_user_sched(user_sched: dict, canon_name: str) -> dict:
     """
     Remove shifts from the visible user schedule if that user has called out
     of the same date/start/end in Supabase.
 
-    This is mainly needed for summer mode because the sheet keeps the caller's
-    name in the cell and only changes the cell color to red/orange.
+    Summer sheets keep the caller's name in the cell and only color it red/orange,
+    so the raw sheet parser will still see the shift unless we filter it here.
     """
     if not getattr(config, "SUMMER_MODE", False):
         return user_sched or {}
@@ -604,33 +628,50 @@ def _remove_called_out_shifts_from_user_sched(user_sched: dict, canon_name: str)
     except Exception:
         return user_sched or {}
 
-    # Collect all dates currently present in this user's parsed schedule.
+    def _block_date(block) -> date | None:
+        if isinstance(block, dict) and block.get("date"):
+            try:
+                return date.fromisoformat(str(block["date"]))
+            except Exception:
+                return None
+        return None
+
+    def _time_minutes(txt: str) -> int | None:
+        raw = str(txt or "").strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.strptime(raw, "%I:%M %p")
+            return dt.hour * 60 + dt.minute
+        except Exception:
+            pass
+        try:
+            dt = datetime.strptime(raw, "%I %p")
+            return dt.hour * 60 + dt.minute
+        except Exception:
+            return None
+
     dates: list[date] = []
     for _day, buckets in (user_sched or {}).items():
         for _src, blocks in (buckets or {}).items():
             for block in blocks or []:
-                if isinstance(block, dict) and block.get("date"):
-                    try:
-                        dates.append(date.fromisoformat(str(block["date"])))
-                    except Exception:
-                        pass
+                d = _block_date(block)
+                if d:
+                    dates.append(d)
 
     if not dates:
         return user_sched or {}
 
-    start_d = min(dates)
-    end_d = max(dates)
-
     try:
         rows = callouts_db.list_callouts_for_week(
             caller_name=canon_name,
-            week_start=start_d,
-            week_end=end_d,
+            week_start=min(dates),
+            week_end=max(dates),
         )
     except Exception:
         return user_sched or {}
 
-    called_out_keys: set[tuple[str, str, str]] = set()
+    called_out_windows: list[tuple[date, int, int]] = []
 
     for row in rows or []:
         try:
@@ -643,15 +684,14 @@ def _remove_called_out_shifts_from_user_sched(user_sched: dict, canon_name: str)
         if not (sdt and edt):
             continue
 
-        called_out_keys.add(
-            (
-                event_d.isoformat(),
-                fmt_time(sdt),
-                fmt_time(edt),
-            )
-        )
+        s_min = sdt.hour * 60 + sdt.minute
+        e_min = edt.hour * 60 + edt.minute
+        if e_min <= s_min:
+            e_min += 24 * 60
 
-    if not called_out_keys:
+        called_out_windows.append((event_d, s_min, e_min))
+
+    if not called_out_windows:
         return user_sched or {}
 
     filtered: dict = {}
@@ -664,29 +704,45 @@ def _remove_called_out_shifts_from_user_sched(user_sched: dict, canon_name: str)
 
             for block in blocks or []:
                 pair = schedule_query._extract_time_pair(block)
-                if not pair:
+                block_d = _block_date(block)
+
+                if not pair or not block_d:
                     kept.append(block)
                     continue
 
                 s_txt, e_txt = pair
-                block_date = None
+                s_min = _time_minutes(s_txt)
+                e_min = _time_minutes(e_txt)
 
-                if isinstance(block, dict) and block.get("date"):
-                    try:
-                        block_date = date.fromisoformat(str(block["date"]))
-                    except Exception:
-                        block_date = None
+                if s_min is None or e_min is None:
+                    kept.append(block)
+                    continue
 
-                if block_date:
-                    key = (block_date.isoformat(), s_txt, e_txt)
-                    if key in called_out_keys:
+                if e_min <= s_min:
+                    e_min += 24 * 60
+
+                remove_it = False
+
+                for callout_d, callout_s, callout_e in called_out_windows:
+                    if callout_d != block_d:
                         continue
+
+                    # Remove the visible shift if the callout overlaps the shift.
+                    # This handles full-shift callouts and partial callouts.
+                    if s_min < callout_e and callout_s < e_min:
+                        remove_it = True
+                        break
+
+                if remove_it:
+                    continue
 
                 kept.append(block)
 
             filtered[day][src] = kept
 
     return filtered
+
+@st.cache_data(ttl=30, show_spinner=False)
 
 def cached_user_schedule(ss_id: str, canon_name: str, epoch):
     ss = st.session_state.get("_SS_HANDLE_BY_ID", {}).get(ss_id)
@@ -2788,8 +2844,39 @@ def run() -> None:
                 # - The BIG number should match the schedule chart/table (raw scheduled hours from Sheets).
                 # - If Supabase is configured, we also show an *adjusted* total after approved callouts/pickups.
                 #   (Users found it confusing when the main number didn't match the schedule table.)
-                ws, we = _week_bounds_la()
+                if getattr(config, "SUMMER_MODE", False):
+                    ws, we = _selected_schedule_week_bounds()
+                else:
+                    ws, we = _week_bounds_la()
+                def _selected_week_schedule_hours(ss, canon_name: str, week_start: date, week_end: date) -> float:
+                    """
+                    Calculate visible scheduled hours for the selected week.
+                    Uses the same parsed/filtered schedule as the chart, so called-out shifts
+                    that were removed from the schedule view do not count.
+                    """
+                    try:
+                        epoch_key = st.session_state.get("UI_EPOCH", 0)
+                        user_sched = cached_user_schedule(ss.id, canon_name, epoch_key)
+                        df = cached_schedule_df(user_sched, epoch_key)
+
+                        if df is None or df.empty or "Date" not in df.columns:
+                            return 0.0
+
+                        mask = (
+                            (pd.to_datetime(df["Date"]).dt.date >= week_start)
+                            & (pd.to_datetime(df["Date"]).dt.date <= week_end)
+                        )
+                        week_df = df[mask].copy()
+
+                        if week_df.empty or "DurationMin" not in week_df.columns:
+                            return 0.0
+
+                        return round(float(week_df["DurationMin"].sum()) / 60.0, 2)
+                    except Exception:
+                        return 0.0
                 scheduled_h = float(hours_now)
+                if getattr(config, "SUMMER_MODE", False):
+                    scheduled_h = _selected_week_schedule_hours(ss, canon_tmp, ws, we)
                 callout_h = pickup_h = 0.0
                 adjusted_h = scheduled_h
                 if callouts_db.supabase_callouts_enabled() and pickups_db.supabase_pickups_enabled():
@@ -2805,15 +2892,19 @@ def run() -> None:
                     except Exception:
                         return str(d)
 
+                if getattr(config, "SUMMER_MODE", False):
+                    scheduled_h = _selected_week_schedule_hours(ss, canon_name, ws, we)
+                    adjusted_h = scheduled_h + pickup_h - callout_h
+
                 subtitle = f"Week: {_fmt_md(ws)}–{_fmt_md(we)}"
                 st.markdown(
                     f"""
                     <div class='oa-hours-card oa-hours-card--classic'>
                       <div class='oa-hours-card__label'>
-                        General hours <span class='oa-hours-card__scope'>(this week)</span>
+                        General hours <span class='oa-hours-card__scope'>(selected week)</span>
                       </div>
                       <div class='oa-hours-card__valueBig'>
-                        {scheduled_h:.1f} <span class='oa-hours-card__cap'>/ 20</span>
+                        {scheduled_h:.1f} <span class='oa-hours-card__cap'>/ 40</span>
                       </div>
                       <div class='oa-hours-card__subline'>
                         Adjusted (callouts/pickups): <b>{adjusted_h:.1f}</b>
@@ -3289,7 +3380,14 @@ def run() -> None:
                                 "event_date": str(event_d),
                                 "shift_start_at": start_at.isoformat(timespec="seconds"),
                                 "shift_end_at": end_at.isoformat(timespec="seconds"),
-                                "duration_hours": round(_duration_hours_between(start_at, end_at), 4),
+                                "duration_hours": round(
+                                    _duration_hours_between(
+                                        start_at,
+                                        end_at,
+                                        subtract_break=(campus_key == "SUMMER"),
+                                    ),
+                                    4,
+                                ),
                             }
                         )
                         db_ok = True
@@ -3430,7 +3528,14 @@ def run() -> None:
                                 "event_date": str(event_d),
                                 "shift_start_at": start_at.isoformat(timespec="seconds"),
                                 "shift_end_at": end_at.isoformat(timespec="seconds"),
-                                "duration_hours": round(_duration_hours_between(start_at, end_at), 4),
+                                "duration_hours": round(
+                                    _duration_hours_between(
+                                        start_at,
+                                        end_at,
+                                        subtract_break=(campus_key == "SUMMER"),
+                                    ),
+                                    4,
+                                ),
                                 "picker_name": requester,
                                 "target_name": target,
                                 "note": kv.get("note"),
@@ -3797,7 +3902,44 @@ def run() -> None:
             user_sched_cached = cached_user_schedule(ss.id, canon_name, epoch_key)
             df_cached = cached_schedule_df(user_sched_cached, epoch_key)
             with st.expander("📊 Your Schedule (This Week)", expanded=st.session_state["sched_expanded"]):
-                schedule_query.render_schedule_viz(st, df_cached, title=f"{canon_name} — This Week")
+                selected_week_start = None
+                selected_week_end = None
+
+                if getattr(config, "SUMMER_MODE", False):
+                    if "schedule_week_offset" not in st.session_state:
+                        st.session_state["schedule_week_offset"] = 0
+
+                    selected_week_start, selected_week_end = _selected_schedule_week_bounds()
+
+                    c_prev, c_label, c_next = st.columns([1, 2, 1])
+
+                    with c_prev:
+                        if st.button("← Previous Week", key="schedule_prev_week", use_container_width=True):
+                            st.session_state["schedule_week_offset"] -= 1
+                            st.rerun()
+
+                    with c_label:
+                        st.markdown(
+                            f"<div style='text-align:center; font-weight:700; padding-top:0.45rem;'>"
+                            f"{selected_week_start.strftime('%b %-d')} – {selected_week_end.strftime('%b %-d')}"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    with c_next:
+                        if st.button("Next Week →", key="schedule_next_week", use_container_width=True):
+                            st.session_state["schedule_week_offset"] += 1
+                            st.rerun() 
+                schedule_query.render_schedule_viz(
+                        st,
+                        df_cached,
+                        title=(
+                            f"{canon_name} — {selected_week_start.strftime('%b %-d')}–{selected_week_end.strftime('%b %-d')}"
+                            if selected_week_start and selected_week_end
+                            else f"{canon_name} — This Week"
+                        ),
+                        week_start=selected_week_start,
+                    )
                 schedule_query.render_schedule_dataframe(st, df_cached)
         except Exception as e:
             st.info(f"Could not render schedule: {_strip_debug_blob(str(e))}")

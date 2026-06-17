@@ -1295,7 +1295,13 @@ def build_schedule_dataframe(user_sched: Dict[str, Dict[str, List[Tuple[str, str
                 if plot_end <= plot_start:
                     plot_end += timedelta(days=1)
 
-                dur_min = int((plot_end - plot_start).total_seconds() // 60)
+                raw_dur_min = int((plot_end - plot_start).total_seconds() // 60)
+                dur_min = raw_dur_min
+                
+                # Summer shifts are scheduled as 8.5-hour windows but include a 30-minute break.
+                # Count them as 8 paid/worked hours while still drawing the full time block.
+                if isinstance(block, dict) and block.get("source") == "Summer" and raw_dur_min >= 510:
+                    dur_min = raw_dur_min - 30
 
                 display_source = "Summer" if isinstance(block, dict) and block.get("source") == "Summer" else src
 
@@ -1337,7 +1343,13 @@ def build_schedule_dataframe(user_sched: Dict[str, Dict[str, List[Tuple[str, str
 
     return df
 
-def render_schedule_viz(st, df: pd.DataFrame, *, title: str = "This Week's Schedule"):
+def render_schedule_viz(
+    st,
+    df: pd.DataFrame,
+    *,
+    title: str = "This Week's Schedule",
+    week_start: date | None = None,
+):
     """
     Calendar view:
       • X-axis: Days (Sun → Sat) with day+date labels shown at the top
@@ -1355,8 +1367,10 @@ def render_schedule_viz(st, df: pd.DataFrame, *, title: str = "This Week's Sched
         from .. import config
 
         if getattr(config, "SUMMER_MODE", False) and "Date" in df.columns:
-            today = week_range_mod.la_today()
-            week_start = today - timedelta(days=((today.weekday() + 1) % 7))
+            if week_start is None:
+                today = week_range_mod.la_today()
+                week_start = today - timedelta(days=((today.weekday() + 1) % 7))
+
             week_end = week_start + timedelta(days=6)
 
             df = df[
@@ -1367,6 +1381,7 @@ def render_schedule_viz(st, df: pd.DataFrame, *, title: str = "This Week's Sched
             if df.empty:
                 st.info("No shifts found for your name this week.")
                 return
+                
     except Exception:
         pass
 
@@ -1376,20 +1391,37 @@ def render_schedule_viz(st, df: pd.DataFrame, *, title: str = "This Week's Sched
         st.info("📈 Install Plotly to enable the pictorial timeline: `pip install plotly`")
         return
 
-    # ---- Days present (Sun→Sat order) ----
+    # ---- Days shown (Sun→Sat order) ----
     day_titles = [_DAY_TITLE[d] for d in _DAY_ORDER]
-    days_present = [d for d in day_titles if d in df["Day"].unique().tolist()]
+
+    if getattr(config, "SUMMER_MODE", False):
+        # In summer mode, always show all seven days so empty days do not disappear.
+        days_present = day_titles
+    else:
+        # Original behavior for school-year mode: only show days with shifts.
+        days_present = [d for d in day_titles if d in df["Day"].unique().tolist()]
+
     if not days_present:
         st.info("No shifts found for your name.")
         return
 
-    # Map each day to a representative date
-    day_to_date = (
-        df.sort_values(["Day", "PlotStartDT"])
-          .groupby("Day", as_index=False)
-          .first()[["Day", "PlotStartDT"]]
-    )
-    day_to_date = {r["Day"]: r["PlotStartDT"].date() for _, r in day_to_date.iterrows()}
+    # Map each day to a representative date.
+    # In summer mode, use week_start so empty days still get correct labels.
+    if getattr(config, "SUMMER_MODE", False) and week_start is not None:
+        day_to_date = {
+            _DAY_TITLE[d]: week_start + timedelta(days=i)
+            for i, d in enumerate(_DAY_ORDER)
+        }
+    else:
+        day_to_date_df = (
+            df.sort_values(["Day", "PlotStartDT"])
+            .groupby("Day", as_index=False)
+            .first()[["Day", "PlotStartDT"]]
+        )
+        day_to_date = {
+            r["Day"]: r["PlotStartDT"].date()
+            for _, r in day_to_date_df.iterrows()
+        }
 
     def _fmt_day_with_date(day_name: str) -> str:
         d = day_to_date.get(day_name)
@@ -1463,6 +1495,19 @@ def render_schedule_viz(st, df: pd.DataFrame, *, title: str = "This Week's Sched
         ))
 
     fig = go.Figure(bars)
+    # Add invisible placeholder points so Plotly reserves all seven day columns,
+    # even when there are no shifts on some days.
+    for d in days_present:
+        fig.add_trace(
+            go.Scatter(
+                x=[d],
+                y=[24],
+                mode="markers",
+                marker=dict(size=0, opacity=0),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
 
     # ---- Y axis ticks (30-min increments) ----
     y_ticks = [7 + i * 0.5 for i in range(int((24 - 7) / 0.5) + 1)]
@@ -1479,6 +1524,8 @@ def render_schedule_viz(st, df: pd.DataFrame, *, title: str = "This Week's Sched
     fig.update_xaxes(
         title="",
         type="category",
+        categoryorder="array",
+        categoryarray=days_present,
         tickmode="array",
         tickvals=days_present,
         ticktext=x_ticktext,
